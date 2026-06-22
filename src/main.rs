@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    fs, io,
+    env, fs, io,
     io::Write,
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -209,6 +209,22 @@ struct MixtapeMedia {
 }
 
 fn main() -> Result<()> {
+    if let Some(argument) = env::args().nth(1) {
+        match argument.as_str() {
+            "--version" | "-V" => {
+                println!("nts {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!(
+                    "nts {}\n\nA terminal home for NTS Radio.\n\nUSAGE:\n    nts\n\nOPTIONS:\n    -h, --help       Print help\n    -V, --version    Print version",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
+            _ => anyhow::bail!("unknown option: {argument}\nTry `nts --help`"),
+        }
+    }
     let mut terminal = ratatui::try_init().context("initialize terminal")?;
     let result = (|| {
         // ratatui-image queries protocol and font metrics while the alternate

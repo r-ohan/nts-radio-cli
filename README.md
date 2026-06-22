@@ -19,22 +19,21 @@ Listen to NTS 1 and NTS 2, browse eight Infinite Mixtapes, see the current show 
 
 ## Install
 
-Homebrew packaging is forthcoming. Until then, install from source:
+Install from the Homebrew tap:
+
+```sh
+brew install r-ohan/nts/nts
+nts
+```
+
+Or install directly from source:
 
 ```sh
 brew install mpv
 cargo install --git https://github.com/r-ohan/nts-radio-cli.git
-nts
 ```
 
-Or run a local checkout:
-
-```sh
-brew install mpv
-cargo run --release
-```
-
-Requires Rust 1.85+ and `mpv`. On macOS, Homebrew is the easiest way to install both.
+The formula installs `mpv` automatically. Source installs require Rust 1.85+ and `mpv`.
 
 ## Controls
 
