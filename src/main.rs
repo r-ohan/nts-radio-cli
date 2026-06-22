@@ -30,7 +30,7 @@ use ratatui::{
 };
 use ratatui_image::{
     Resize, StatefulImage,
-    picker::Picker,
+    picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
 use reqwest::blocking::Client;
@@ -275,6 +275,9 @@ impl App {
 
     fn apply_channel_updates(&mut self, updates: Vec<ChannelUpdate>) {
         let picker = self.picker.clone();
+        // On a text-only terminal we deliberately omit artwork rather than fall
+        // back to a half-block raster (see README). Skip building the protocol.
+        let supports_artwork = picker.protocol_type() != ProtocolType::Halfblocks;
         for update in updates {
             let channel = &mut self.channels[update.index];
             channel.show = update.show;
@@ -289,7 +292,7 @@ impl App {
             if let Some(stream) = update.stream {
                 channel.stream = stream;
             }
-            if let Some(image) = update.artwork {
+            if supports_artwork && let Some(image) = update.artwork {
                 channel.artwork = Some(RefCell::new(picker.new_resize_protocol(image)));
             }
         }
