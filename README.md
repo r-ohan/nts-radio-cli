@@ -42,7 +42,7 @@ NTS's live metadata occasionally lags a handover. `nts` reconciles the timestamp
 
 ## Artwork
 
-The app uses `ratatui-image` to query the terminal’s image capabilities and map artwork to its layout rectangle. Kitty, iTerm2, and Sixel are supported by the renderer. On a text-only terminal, artwork is deliberately omitted rather than reduced to an ugly text raster.
+The app uses `ratatui-image` to query the terminal’s image capabilities and map artwork to its layout rectangle. The Kitty, iTerm2, and Sixel graphics protocols are supported, so terminals like Ghostty, iTerm2, Kitty, and WezTerm display cover art. On a text-only terminal, artwork is deliberately omitted rather than reduced to an ugly text raster.
 
 NTS publishes the direct NTS 1 and NTS 2 streams in its [support documentation](https://ntslive.freshdesk.com/support/solutions/articles/77000587257-tunein). The app uses NTS’s public live endpoint for display metadata.
 
