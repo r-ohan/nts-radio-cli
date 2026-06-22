@@ -1,0 +1,123 @@
+use std::sync::mpsc::Sender;
+
+#[derive(Clone, Copy, Debug)]
+pub enum MediaCommand {
+    TogglePlayback,
+    NextStation,
+    PreviousStation,
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::{MediaCommand, Sender};
+    use block2::RcBlock;
+    use objc2::{rc::Retained, runtime::AnyObject};
+    use objc2_foundation::{NSDictionary, NSNumber, NSString};
+    use objc2_media_player::{
+        MPMediaItemPropertyAlbumTitle, MPMediaItemPropertyArtist, MPMediaItemPropertyTitle,
+        MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyIsLiveStream,
+        MPNowPlayingInfoPropertyPlaybackRate, MPNowPlayingPlaybackState,
+        MPRemoteCommandHandlerStatus,
+    };
+
+    pub struct NowPlaying {
+        center: Retained<MPNowPlayingInfoCenter>,
+        // MPRemoteCommandCenter keeps the callbacks alive, but retaining the
+        // opaque command targets makes that ownership explicit on our side.
+        _command_targets: Vec<Retained<AnyObject>>,
+    }
+
+    impl NowPlaying {
+        pub fn new(sender: Sender<MediaCommand>) -> Self {
+            // MediaPlayer is an Apple system framework and is only linked on
+            // macOS; all uses stay on the application's main thread.
+            let center = unsafe { MPNowPlayingInfoCenter::defaultCenter() };
+            let commands =
+                unsafe { objc2_media_player::MPRemoteCommandCenter::sharedCommandCenter() };
+            let mut targets = Vec::new();
+            for (command, event) in [
+                (
+                    unsafe { commands.togglePlayPauseCommand() },
+                    MediaCommand::TogglePlayback,
+                ),
+                (
+                    unsafe { commands.nextTrackCommand() },
+                    MediaCommand::NextStation,
+                ),
+                (
+                    unsafe { commands.previousTrackCommand() },
+                    MediaCommand::PreviousStation,
+                ),
+            ] {
+                let sender = sender.clone();
+                let handler = RcBlock::new(move |_| {
+                    let _ = sender.send(event);
+                    MPRemoteCommandHandlerStatus::Success
+                });
+                let target = unsafe { command.addTargetWithHandler(&handler) };
+                targets.push(target);
+            }
+            Self {
+                center,
+                _command_targets: targets,
+            }
+        }
+
+        pub fn update(&self, title: &str, station: &str, playing: bool) {
+            let title = NSString::from_str(title);
+            let station = NSString::from_str(station);
+            let live = NSNumber::new_bool(true);
+            let rate = NSNumber::new_f64(if playing { 1.0 } else { 0.0 });
+            let values: Vec<Retained<AnyObject>> = vec![
+                title.into_super().into(),
+                station.clone().into_super().into(),
+                station.into_super().into(),
+                live.into_super().into(),
+                rate.into_super().into(),
+            ];
+            let info = unsafe {
+                NSDictionary::from_retained_objects(
+                    &[
+                        MPMediaItemPropertyTitle,
+                        MPMediaItemPropertyArtist,
+                        MPMediaItemPropertyAlbumTitle,
+                        MPNowPlayingInfoPropertyIsLiveStream,
+                        MPNowPlayingInfoPropertyPlaybackRate,
+                    ],
+                    &values,
+                )
+            };
+            unsafe {
+                self.center.setNowPlayingInfo(Some(&info));
+                self.center.setPlaybackState(if playing {
+                    MPNowPlayingPlaybackState::Playing
+                } else {
+                    MPNowPlayingPlaybackState::Paused
+                });
+            }
+        }
+
+        pub fn clear(&self) {
+            unsafe { self.center.setNowPlayingInfo(None) }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod platform {
+    use super::{MediaCommand, Sender};
+
+    pub struct NowPlaying;
+
+    impl NowPlaying {
+        pub fn new(_: Sender<MediaCommand>) -> Self {
+            Self
+        }
+
+        pub fn update(&self, _: &str, _: &str, _: bool) {}
+
+        pub fn clear(&self) {}
+    }
+}
+
+pub use platform::NowPlaying;
