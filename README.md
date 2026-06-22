@@ -2,6 +2,10 @@
 
 ### NTS Radio, in your terminal.
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="nts — a live NTS 2 show with artwork, now/next details, and station list" width="900">
+</p>
+
 `nts` is an unofficial NTS Radio player for the terminal, written in Rust.
 Listen live, move between stations without interrupting playback, see what is
 on now and next in your local time, and disappear into the Infinite Mixtapes.
