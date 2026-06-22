@@ -1,6 +1,6 @@
 [package]
-name = "nts"
-version = "0.1.0"
+name = "nts-radio-cli"
+version = "0.1.1"
 edition = "2024"
 description = "A rich terminal home for NTS Radio"
 license = "MIT"
@@ -9,6 +9,10 @@ repository = "https://github.com/r-ohan/nts-radio-cli"
 homepage = "https://github.com/r-ohan/nts-radio-cli"
 keywords = ["nts", "radio", "terminal", "ratatui", "tui"]
 categories = ["command-line-utilities", "multimedia::audio"]
+
+[[bin]]
+name = "nts"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
