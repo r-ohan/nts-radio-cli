@@ -5,7 +5,10 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -56,6 +59,12 @@ const BASE: Color = Color::Rgb(26, 25, 23);
 const SURFACE: Color = Color::Rgb(15, 15, 14);
 const BORDER: Color = Color::Rgb(84, 82, 77);
 const NTS_ARTWORK_ASPECT: f32 = 1.6;
+
+// mpv's PID, mirrored here so the signal guard (see `spawn_signal_guard`) can
+// stop playback when the process is killed by a signal — `cmd+w` on a terminal
+// tab sends SIGHUP, which never unwinds the stack, so `App`'s `Drop` (and its
+// `stop_player`) never run. 0 means there is no live player.
+static MPV_PID: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelKind {
@@ -226,6 +235,7 @@ fn main() -> Result<()> {
         }
     }
     let mut terminal = ratatui::try_init().context("initialize terminal")?;
+    spawn_signal_guard();
     let result = (|| {
         // ratatui-image queries protocol and font metrics while the alternate
         // screen is active and before event handling begins.
@@ -248,6 +258,40 @@ fn main() -> Result<()> {
     restore_result?;
     result
 }
+
+/// Stops mpv when the process is terminated by a signal rather than a clean
+/// exit. `cmd+w` on a terminal tab/window sends SIGHUP and `kill` sends SIGTERM;
+/// the default action for both ends the process immediately, so `App`'s `Drop`
+/// never runs and mpv (a child with no controlling terminal) would be orphaned
+/// and keep playing. A dedicated thread waits for those signals, stops mpv,
+/// restores the terminal, and exits.
+#[cfg(unix)]
+fn spawn_signal_guard() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let mut signals = match Signals::new([SIGHUP, SIGTERM, SIGINT]) {
+        Ok(signals) => signals,
+        Err(_) => return,
+    };
+    thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            let pid = MPV_PID.load(Ordering::Relaxed);
+            if pid > 0 {
+                // SAFETY: `kill` is a plain libc call; `pid` is mpv's, recorded
+                // in `Player::start` and cleared in `Player::stop`.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+            let _ = ratatui::try_restore();
+            std::process::exit(0);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_guard() {}
 
 impl App {
     fn load(picker: &Picker, media_sender: mpsc::Sender<MediaCommand>) -> Self {
@@ -684,6 +728,7 @@ impl Player {
                 _ => anyhow::Error::new(error).context("start mpv"),
             })?;
 
+        MPV_PID.store(child.id() as i32, Ordering::Relaxed);
         Ok(Self { child, ipc_path })
     }
 
@@ -735,6 +780,7 @@ impl Player {
     fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        MPV_PID.store(0, Ordering::Relaxed);
         let _ = fs::remove_file(&self.ipc_path);
     }
 }

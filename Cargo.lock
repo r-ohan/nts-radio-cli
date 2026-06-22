@@ -1515,6 +1515,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "image",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-media-player",
@@ -1523,6 +1524,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]
