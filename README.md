@@ -1,39 +1,56 @@
 # nts
 
-A rich, responsive terminal home for [NTS Radio](https://www.nts.live), built with Rust, Ratatui, and `ratatui-image`.
+An unofficial, rich terminal home for [NTS Radio](https://www.nts.live), built with Rust, Ratatui, and `ratatui-image`.
 
-Listen to NTS 1 and 2, browse eight NTS Infinite Mixtapes, see the current show and local-time schedule, and—in terminals with an image protocol—view actual artwork without breaking the terminal layout.
-`mpv` stays running while you browse, so changing station retunes the player instead of restarting it.
+Listen to NTS 1 and NTS 2, browse eight Infinite Mixtapes, see the current show and local-time schedule, and discover a little braille visualizer. In terminals with an image protocol, it renders the actual show artwork without compromising the layout.
 
-## Local development
+`mpv` stays running while you browse: station changes reuse the player process rather than restart it.
+
+> NTS is a trademark of NTS. This is an independent, unofficial client and is not affiliated with NTS.
+
+## Features
+
+- Starts NTS 1 on launch; switch stations without stopping playback.
+- Live now-playing metadata, scheduled handovers, and local-time schedules.
+- Eight NTS Infinite Mixtapes in a dedicated Explore overlay.
+- Native macOS Now Playing integration and media-key controls.
+- Artwork via Kitty, iTerm2, and Sixel terminal graphics protocols.
+- A responsive compact layout, plus a hidden `v` visualizer moment.
+
+## Install
+
+Homebrew packaging is forthcoming. Until then, install from source:
 
 ```sh
 brew install mpv
-cargo run
-```
-
-To install a local binary named `nts`:
-
-```sh
-cargo install --path .
+cargo install --git https://github.com/r-ohan/nts-radio-cli.git
 nts
 ```
+
+Or run a local checkout:
+
+```sh
+brew install mpv
+cargo run --release
+```
+
+Requires Rust 1.85+ and `mpv`. On macOS, Homebrew is the easiest way to install both.
 
 ## Controls
 
 | Key | Action |
 | --- | --- |
 | `space` / `enter` | play or stop; in Explore, listen to the highlighted station |
-| `1`, `2` | select or retune a channel |
-| `↑↓`, `j k` | move selection / retune while listening |
+| `1`, `2` | select or change to a radio station |
+| `↑↓`, `j k` | move selection / change station while listening |
 | `e` | open Infinite Mixtapes Explore |
 | `s` | toggle the selected live channel's local-time schedule |
+| `v` | open or close the visualizer |
 | `esc` | close Schedule or Explore; quit from the main view |
 | `q` | quit |
 
-## Motion and playback
+## Playback and metadata
 
-The app uses TachyonFX for brief selection sweeps rather than a constantly busy UI.
 Playback requires `mpv`; it is controlled through its local JSON IPC socket so a channel change can use `loadfile … replace` in the existing player process. The new station still has to establish its own network stream, but process startup is no longer part of the wait. `nts` queries mpv's playback state, surfaces stream startup as buffering, and will make one clean reconnect attempt if the player disappears.
 
 On macOS, `nts` also publishes the current show to the system Now Playing interface. System play/pause and next/previous commands control the same active station session.
@@ -46,6 +63,14 @@ The app uses `ratatui-image` to query the terminal’s image capabilities and ma
 
 NTS publishes the direct NTS 1 and NTS 2 streams in its [support documentation](https://ntslive.freshdesk.com/support/solutions/articles/77000587257-tunein). The app uses NTS’s public live endpoint for display metadata.
 
-## Release
+## Development
 
-The formula will declare `mpv` as a dependency, so `brew install nts` will install it automatically. Publishing needs the eventual GitHub repository and Homebrew tap location to generate a real, checksum-pinned formula.
+```sh
+cargo test
+cargo clippy -- -D warnings
+cargo run --release
+```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

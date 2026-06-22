@@ -3,6 +3,8 @@ use std::sync::mpsc::Sender;
 #[derive(Clone, Copy, Debug)]
 pub enum MediaCommand {
     TogglePlayback,
+    Play,
+    StopPlayback,
     NextStation,
     PreviousStation,
 }
@@ -12,7 +14,9 @@ mod platform {
     use super::{MediaCommand, Sender};
     use block2::RcBlock;
     use objc2::{rc::Retained, runtime::AnyObject};
-    use objc2_foundation::{NSDictionary, NSNumber, NSString};
+    use objc2_foundation::{
+        NSDate, NSDefaultRunLoopMode, NSDictionary, NSNumber, NSRunLoop, NSString,
+    };
     use objc2_media_player::{
         MPMediaItemPropertyAlbumTitle, MPMediaItemPropertyArtist, MPMediaItemPropertyTitle,
         MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyIsLiveStream,
@@ -40,6 +44,15 @@ mod platform {
                     unsafe { commands.togglePlayPauseCommand() },
                     MediaCommand::TogglePlayback,
                 ),
+                (unsafe { commands.playCommand() }, MediaCommand::Play),
+                (
+                    unsafe { commands.pauseCommand() },
+                    MediaCommand::StopPlayback,
+                ),
+                (
+                    unsafe { commands.stopCommand() },
+                    MediaCommand::StopPlayback,
+                ),
                 (
                     unsafe { commands.nextTrackCommand() },
                     MediaCommand::NextStation,
@@ -49,6 +62,9 @@ mod platform {
                     MediaCommand::PreviousStation,
                 ),
             ] {
+                // Command-center defaults vary by source and macOS release;
+                // make the live-radio controls explicitly actionable.
+                unsafe { command.setEnabled(true) };
                 let sender = sender.clone();
                 let handler = RcBlock::new(move |_| {
                     let _ = sender.send(event);
@@ -92,9 +108,19 @@ mod platform {
                 self.center.setPlaybackState(if playing {
                     MPNowPlayingPlaybackState::Playing
                 } else {
-                    MPNowPlayingPlaybackState::Paused
+                    MPNowPlayingPlaybackState::Stopped
                 });
             }
+        }
+
+        /// `MPRemoteCommandCenter` delivers command handlers through Cocoa's
+        /// main run loop. A Ratatui app owns its own event loop, so service one
+        /// non-blocking Cocoa turn alongside each terminal tick.
+        pub fn pump(&self) {
+            let run_loop = NSRunLoop::mainRunLoop();
+            let limit = NSDate::dateWithTimeIntervalSinceNow(0.0);
+            let mode = unsafe { NSDefaultRunLoopMode };
+            let _ = run_loop.runMode_beforeDate(mode, &limit);
         }
 
         pub fn clear(&self) {
@@ -115,6 +141,8 @@ mod platform {
         }
 
         pub fn update(&self, _: &str, _: &str, _: bool) {}
+
+        pub fn pump(&self) {}
 
         pub fn clear(&self) {}
     }

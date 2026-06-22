@@ -15,14 +15,11 @@ use chrono::{DateTime, Local, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
-    },
+    terminal::SetTitle,
 };
 use image::DynamicImage;
 use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
+    DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -37,7 +34,6 @@ use ratatui_image::{
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tachyonfx::{EffectManager, EffectTimer, Interpolation, Motion, fx};
 
 mod now_playing;
 use now_playing::{MediaCommand, NowPlaying};
@@ -51,10 +47,14 @@ const NTS_1_STREAM: &str = "https://stream-relay-geo.ntslive.net/stream?client=d
 const NTS_2_STREAM: &str = "https://stream-relay-geo.ntslive.net/stream2?client=direct";
 
 const INK: Color = Color::Rgb(248, 247, 242);
-const MUTED: Color = Color::Rgb(142, 139, 133);
+const MUTED: Color = Color::Rgb(156, 153, 147);
 const SIGNAL: Color = Color::Rgb(255, 72, 104);
+// BASE is the app-wide canvas; SURFACE is the slightly darker inset for cards.
+// Painting BASE ourselves (rather than relying on the terminal's default
+// background) keeps INK text high-contrast everywhere, not just inside cards.
+const BASE: Color = Color::Rgb(26, 25, 23);
 const SURFACE: Color = Color::Rgb(15, 15, 14);
-const BORDER: Color = Color::Rgb(54, 53, 50);
+const BORDER: Color = Color::Rgb(84, 82, 77);
 const NTS_ARTWORK_ASPECT: f32 = 1.6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +102,6 @@ struct App {
     playing: bool,
     buffering: bool,
     player: Option<Player>,
-    effects: EffectManager<&'static str>,
     picker: Picker,
     now_playing: Option<NowPlaying>,
     visualizer: Option<LiveVisualizer>,
@@ -210,7 +209,7 @@ struct MixtapeMedia {
 }
 
 fn main() -> Result<()> {
-    let mut terminal = setup_terminal()?;
+    let mut terminal = ratatui::try_init().context("initialize terminal")?;
     let result = (|| {
         // ratatui-image queries protocol and font metrics while the alternate
         // screen is active and before event handling begins.
@@ -225,7 +224,12 @@ fn main() -> Result<()> {
         app.stop_player();
         result
     })();
-    restore_terminal(&mut terminal)?;
+    // `try_restore` covers raw mode and the alternate screen; restore the
+    // cursor separately because the terminal may have been left mid-frame.
+    let cursor_result = terminal.show_cursor().context("restore terminal cursor");
+    let restore_result = ratatui::try_restore().context("restore terminal");
+    cursor_result?;
+    restore_result?;
     result
 }
 
@@ -234,23 +238,20 @@ impl App {
         // Return immediately with fallback copy so the first frame paints and
         // accepts input without waiting on the network. Live show titles and
         // artwork stream in from a background thread (see `run`).
-        let mut app = Self {
+        Self {
             channels: fallback_channels(),
             selected: 0,
             explore_selected: 0,
             playing: false,
             buffering: false,
             player: None,
-            effects: EffectManager::default(),
             picker: picker.clone(),
             now_playing: Some(NowPlaying::new(media_sender)),
             visualizer: None,
             view: View::Listen,
             error: None,
             encoded_tx: None,
-        };
-        app.animate_selection();
-        app
+        }
     }
 
     /// Whether the terminal has a graphics protocol. On text-only terminals we
@@ -291,7 +292,13 @@ impl App {
         let supports_artwork = self.supports_artwork();
         for update in updates {
             let index = update.index;
-            let channel = &mut self.channels[index];
+            // Background responses are external input. A malformed or stale
+            // response must never take the terminal down with an out-of-bounds
+            // panic; it is safe to discard because the next refresh contains
+            // the complete channel snapshot again.
+            let Some(channel) = self.channels.get_mut(index) else {
+                continue;
+            };
             channel.show = update.show;
             channel.description = update.description;
             channel.next_show = update.next_show;
@@ -300,7 +307,15 @@ impl App {
             if let Some(schedule) = update.schedule {
                 channel.schedule = schedule;
             }
-            channel.artwork_url = update.artwork_url;
+            // Only remember a URL after its image actually decoded. Recording
+            // a transiently failed CDN request here would suppress every later
+            // retry because fetch_live_updates sees it as already loaded.
+            if update.artwork.is_some() {
+                channel.artwork_url = update.artwork_url.clone();
+            } else if update.artwork_url.is_none() {
+                channel.artwork_url = None;
+                channel.artwork = None;
+            }
             if let Some(stream) = update.stream {
                 channel.stream = stream;
             }
@@ -356,14 +371,15 @@ impl App {
     }
 
     fn select_channel(&mut self, index: usize) {
-        if index == self.selected {
+        // Keep this boundary defensive: keyboard shortcuts, media controls,
+        // and future UI surfaces all converge here.
+        if index >= self.channels.len() || index == self.selected {
             return;
         }
 
         self.selected = index;
-        self.animate_selection();
 
-        // A channel selection is a retune, not merely a cursor move. Keep the
+        // A channel selection changes stations, not merely the cursor. Keep the
         // listening state intact and ask the already-running player to load
         // the new stream. This avoids process startup on every switch.
         if self.playing {
@@ -372,10 +388,10 @@ impl App {
                 .player
                 .as_mut()
                 .context("player process disappeared")
-                .and_then(|player| player.retune(&stream));
+                .and_then(|player| player.change_station(&stream));
             if let Err(error) = result {
                 // If the player has died, recover by starting it once more.
-                // The common path above is a low-latency IPC retune.
+                // The common path above is a low-latency IPC station change.
                 self.stop_player();
                 match launch_player(&stream) {
                     Ok(player) => {
@@ -386,7 +402,7 @@ impl App {
                     }
                     Err(restart_error) => {
                         self.error = Some(format!(
-                            "Could not retune: {error}; restart failed: {restart_error}"
+                            "Could not change station: {error}; restart failed: {restart_error}"
                         ))
                     }
                 }
@@ -445,16 +461,66 @@ impl App {
         }
     }
 
+    fn pump_now_playing(&self) {
+        if let Some(now_playing) = &self.now_playing {
+            now_playing.pump();
+        }
+    }
+
     fn handle_media_command(&mut self, command: MediaCommand) {
         match command {
             MediaCommand::TogglePlayback => self.toggle_playback(),
-            MediaCommand::NextStation => {
-                self.view = View::Listen;
-                self.select_channel((self.selected + 1).min(self.channels.len() - 1));
+            MediaCommand::Play if !self.playing => self.toggle_playback(),
+            MediaCommand::Play => {}
+            MediaCommand::StopPlayback if self.playing => self.stop_player(),
+            MediaCommand::StopPlayback => {}
+            MediaCommand::NextStation if self.view != View::Schedule => {
+                self.change_station(
+                    self.selected
+                        .saturating_add(1)
+                        .min(self.channels.len().saturating_sub(1)),
+                );
             }
-            MediaCommand::PreviousStation => {
-                self.view = View::Listen;
-                self.select_channel(self.selected.saturating_sub(1));
+            MediaCommand::NextStation => {}
+            MediaCommand::PreviousStation if self.view != View::Schedule => {
+                self.change_station(self.selected.saturating_sub(1));
+            }
+            MediaCommand::PreviousStation => {}
+        }
+    }
+
+    /// Select a station from a direct shortcut or a system media control.
+    /// Schedule is intentionally read-only: leaving it should always be an
+    /// explicit action rather than an accidental station change.
+    fn change_station(&mut self, index: usize) -> bool {
+        if self.view == View::Schedule || index >= self.channels.len() {
+            return false;
+        }
+        self.view = View::Listen;
+        self.select_channel(index);
+        true
+    }
+
+    /// Route directional input according to the active surface. Keeping this
+    /// in one place prevents key bindings from drifting apart as views grow.
+    fn navigate(&mut self, direction: isize) -> bool {
+        match self.view {
+            View::Listen => {
+                if self.channels.is_empty() {
+                    return false;
+                }
+                let target = if direction < 0 {
+                    self.selected.saturating_sub(1)
+                } else {
+                    self.selected.saturating_add(1).min(self.channels.len() - 1)
+                };
+                self.select_channel(target);
+                true
+            }
+            View::Schedule => false,
+            View::Explore => {
+                self.move_explore(direction);
+                true
             }
         }
     }
@@ -472,7 +538,12 @@ impl App {
         }
     }
 
-    fn open_explore(&mut self) {
+    fn toggle_explore(&mut self) {
+        if self.view == View::Explore {
+            self.view = View::Listen;
+            self.error = None;
+            return;
+        }
         self.explore_selected = self
             .selected
             .saturating_sub(2)
@@ -500,19 +571,6 @@ impl App {
         self.choose_explore();
         if !was_playing {
             self.toggle_playback();
-        }
-    }
-
-    fn move_schedule_channel(&mut self, direction: isize) {
-        let target = (self.selected as isize + direction)
-            .clamp(0, self.channels.len().saturating_sub(1) as isize) as usize;
-        if self.channels[target].kind == ChannelKind::Live {
-            self.select_channel(target);
-        } else {
-            // Preserve the effortless linear station walk. Leaving NTS 2 for
-            // a mixtape simply closes the schedule lens before retuning.
-            self.view = View::Listen;
-            self.select_channel(target);
         }
     }
 
@@ -558,19 +616,6 @@ impl App {
             }
         }
     }
-
-    fn animate_selection(&mut self) {
-        self.effects.add_unique_effect(
-            "selection",
-            fx::sweep_in(
-                Motion::LeftToRight,
-                8,
-                0,
-                SURFACE,
-                EffectTimer::from_ms(220, Interpolation::QuadOut),
-            ),
-        );
-    }
 }
 
 impl Drop for App {
@@ -598,11 +643,15 @@ impl Player {
                 "--no-video",
                 "--really-quiet",
                 "--input-terminal=no",
+                // The app owns macOS media controls through Now Playing. If
+                // mpv receives the same hardware key, it pauses its own live
+                // buffer instead of letting us stop and reconnect at live edge.
+                "--input-media-keys=no",
                 "--cache-secs=0.2",
                 "--demuxer-readahead-secs=0.2",
                 "--cache-pause-wait=0.1",
                 // NTS's direct streams identify their audio format quickly.
-                // Avoid mpv's conservative default probe window on retune.
+                // Avoid mpv's conservative default probe window on station changes.
                 "--demuxer-lavf-probesize=32768",
                 "--demuxer-lavf-analyzeduration=0",
                 &ipc_arg,
@@ -622,7 +671,7 @@ impl Player {
         Ok(Self { child, ipc_path })
     }
 
-    fn retune(&mut self, stream: &str) -> Result<()> {
+    fn change_station(&mut self, stream: &str) -> Result<()> {
         if let Some(status) = self.child.try_wait().context("check mpv status")? {
             anyhow::bail!("mpv exited with {status}");
         }
@@ -632,7 +681,7 @@ impl Player {
         socket
             .write_all(command.as_bytes())
             .and_then(|_| socket.write_all(b"\n"))
-            .context("send retune command to mpv")
+            .context("send station change command to mpv")
     }
 
     fn is_buffering(&mut self) -> Result<bool> {
@@ -802,15 +851,12 @@ fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<Cha
         let Details {
             name: next_name, ..
         } = next.embeds.details.unwrap_or_default();
-        let artwork_url = now_media.picture_medium.or(now_media.picture_thumb);
-        let artwork = if artwork_url != known_artwork_urls[index] {
-            artwork_url
-                .as_deref()
-                .and_then(|url| fetch_image(&client, url).ok())
-                .map(crop_to_landscape)
-        } else {
-            None
-        };
+        let (artwork_url, artwork) = fetch_artwork(
+            &client,
+            now_media.picture_medium.as_deref(),
+            now_media.picture_thumb.as_deref(),
+            known_artwork_urls[index].as_deref(),
+        );
 
         updates.push(ChannelUpdate {
             index,
@@ -879,16 +925,13 @@ fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<
             .send()?
             .error_for_status()?
             .json()?;
-        let artwork_url = mixtape.media.picture_medium.or(mixtape.media.picture_thumb);
         let index = offset + 2;
-        let artwork = if artwork_url != known_artwork_urls[index] {
-            artwork_url
-                .as_deref()
-                .and_then(|url| fetch_image(&client, url).ok())
-                .map(crop_to_landscape)
-        } else {
-            None
-        };
+        let (artwork_url, artwork) = fetch_artwork(
+            &client,
+            mixtape.media.picture_medium.as_deref(),
+            mixtape.media.picture_thumb.as_deref(),
+            known_artwork_urls[index].as_deref(),
+        );
         updates.push(ChannelUpdate {
             index,
             show: mixtape.title,
@@ -960,8 +1003,32 @@ fn broadcast_time(timestamp: Option<&str>) -> String {
 }
 
 fn fetch_image(client: &Client, url: &str) -> Result<DynamicImage> {
-    let bytes = client.get(url).send()?.error_for_status()?.bytes()?;
+    let bytes = client
+        .get(url)
+        .timeout(Duration::from_secs(4))
+        .send()?
+        .error_for_status()?
+        .bytes()?;
     image::load_from_memory(&bytes).context("decode NTS artwork")
+}
+
+fn fetch_artwork(
+    client: &Client,
+    medium: Option<&str>,
+    thumb: Option<&str>,
+    known_url: Option<&str>,
+) -> (Option<String>, Option<DynamicImage>) {
+    for url in [medium, thumb].into_iter().flatten() {
+        // The stored URL is only set after a successful decode, so it is safe
+        // to skip. A failed URL remains absent and will be retried later.
+        if Some(url) == known_url {
+            return (Some(url.to_owned()), None);
+        }
+        if let Ok(image) = fetch_image(client, url) {
+            return (Some(url.to_owned()), Some(crop_to_landscape(image)));
+        }
+    }
+    (medium.or(thumb).map(str::to_owned), None)
 }
 
 /// Center-crop to NTS's landscape aspect. The cards are artwork-led and expect
@@ -984,20 +1051,6 @@ fn launch_player(stream: &str) -> Result<Player> {
     // `Player::start`. Probing with `mpv --version` first would block the
     // caller on a synchronous subprocess for no added safety.
     Player::start(stream)
-}
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout)).context("start terminal UI")
-}
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
 }
 
 fn drain_startup_responses() -> Result<()> {
@@ -1062,12 +1115,11 @@ fn request_mixtape_refresh(
 }
 
 fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut DefaultTerminal,
     app: &mut App,
     media_rx: mpsc::Receiver<MediaCommand>,
 ) -> Result<()> {
     let mut dirty = true;
-    let mut last_frame = Instant::now();
     let mut title_frame = 0;
     let mut title_dirty = true;
     let mut next_title_tick = Instant::now();
@@ -1088,6 +1140,7 @@ fn run(
 
     request_mixtape_refresh(&update_tx, app.artwork_urls());
     loop {
+        app.pump_now_playing();
         let now = Instant::now();
         while let Ok(command) = media_rx.try_recv() {
             app.handle_media_command(command);
@@ -1160,25 +1213,13 @@ fn run(
             dirty = true;
             title_dirty = true;
         }
-        if dirty || app.effects.is_running() {
-            let elapsed = if dirty {
-                Duration::ZERO
-            } else {
-                last_frame.elapsed()
-            };
+        if dirty {
             terminal.draw(|frame| {
-                let effect_area = draw(frame, app);
-                app.effects
-                    .process_effects(elapsed.into(), frame.buffer_mut(), effect_area);
+                draw(frame, app);
             })?;
             dirty = false;
-            last_frame = Instant::now();
         }
-        let mut poll_interval = if app.effects.is_running() {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_millis(120)
-        };
+        let mut poll_interval = Duration::from_millis(120);
         if app.playing {
             poll_interval =
                 poll_interval.min(next_title_tick.saturating_duration_since(Instant::now()));
@@ -1213,18 +1254,10 @@ fn run(
                     }
                     true
                 }
-                KeyCode::Char('1') => {
-                    app.view = View::Listen;
-                    app.select_channel(0);
-                    true
-                }
-                KeyCode::Char('2') => {
-                    app.view = View::Listen;
-                    app.select_channel(1);
-                    true
-                }
+                KeyCode::Char('1') => app.change_station(0),
+                KeyCode::Char('2') => app.change_station(1),
                 KeyCode::Char('e') | KeyCode::Char('E') => {
-                    app.open_explore();
+                    app.toggle_explore();
                     true
                 }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
@@ -1232,22 +1265,10 @@ fn run(
                     true
                 }
                 KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h') => {
-                    match app.view {
-                        View::Listen => app.select_channel(app.selected.saturating_sub(1)),
-                        View::Schedule => app.move_schedule_channel(-1),
-                        View::Explore => app.move_explore(-1),
-                    }
-                    true
+                    app.navigate(-1)
                 }
                 KeyCode::Down | KeyCode::Right | KeyCode::Char('j') | KeyCode::Char('l') => {
-                    match app.view {
-                        View::Listen => {
-                            app.select_channel((app.selected + 1).min(app.channels.len() - 1))
-                        }
-                        View::Schedule => app.move_schedule_channel(1),
-                        View::Explore => app.move_explore(1),
-                    }
-                    true
+                    app.navigate(1)
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if app.view == View::Explore {
@@ -1267,10 +1288,11 @@ fn run(
                 }
                 _ => false,
             };
-            if dirty && had_overlay && app.visualizer.is_none() && app.view == View::Listen {
+            let has_overlay = app.visualizer.is_some() || app.view != View::Listen;
+            if dirty && had_overlay != has_overlay {
                 // A modal clears cells that may be occupied by a terminal
                 // graphics-protocol image. Reset Ratatui's previous buffer so
-                // the uncovered artwork is sent again on the next draw.
+                // overlays and uncovered artwork start from a clean canvas.
                 terminal.clear()?;
             }
             title_dirty = title_dirty || dirty;
@@ -1309,9 +1331,12 @@ fn title_copy(value: &str) -> String {
     }
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
+fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let compact = area.width < 110 || area.height < 30;
+    // Paint our own dark canvas so INK text stays high-contrast regardless of
+    // the terminal's default background colour.
+    frame.render_widget(Block::default().style(Style::default().bg(BASE)), area);
     // Terminal image protocols are rendered independently of Ratatui's cell
     // buffer. Render the visualizer as an exclusive surface so an artwork
     // update cannot leap above its braille layer during a station change.
@@ -1319,8 +1344,12 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
         frame.render_widget(Clear, area);
         frame.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
         draw_visualizer_modal(frame, app, compact);
-        return Rect::default();
+        return;
     }
+    // Terminal graphics-protocol images do not share Ratatui's z-order. Keep
+    // the regular UI behind overlays, but omit its artwork while a modal is
+    // open so a late image placement cannot paint through the modal.
+    let show_background_artwork = app.view == View::Listen;
     if compact {
         let main = Layout::default()
             .direction(Direction::Vertical)
@@ -1332,7 +1361,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
             ])
             .split(area);
         draw_compact_header(frame, app, main[0]);
-        let card = draw_compact(frame, app, main[1]);
+        draw_compact(frame, app, main[1], show_background_artwork);
         render_footer(frame, app, main[2], true);
         render_error(frame, app, main[2]);
         render_terminal_hint(frame, app, main[2]);
@@ -1341,7 +1370,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
             View::Explore => draw_explore_modal(frame, app, true),
             View::Listen => {}
         }
-        return card;
+        return;
     }
 
     let main = Layout::default()
@@ -1373,7 +1402,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
         main[1],
     );
 
-    let card = draw_wide_channels(frame, app, main[2]);
+    draw_wide_channels(frame, app, main[2], show_background_artwork);
     render_footer(frame, app, main[3], false);
     render_error(frame, app, main[3]);
     render_terminal_hint(frame, app, main[3]);
@@ -1382,8 +1411,6 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
         View::Explore => draw_explore_modal(frame, app, false),
         View::Listen => {}
     }
-
-    card
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, compact: bool) {
@@ -1394,7 +1421,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, compact: bool) {
             "↑↓ browse  •  e explore  •  s schedule  •  v visualizer  •  space listen"
         }
     } else if app.playing {
-        "↑↓ / j k retune    •    1 2 radio    •    e explore    •    s schedule    •    v visualizer    •    space stop    •    q quit"
+        "↑↓ / j k change station    •    1 2 radio    •    e explore    •    s schedule    •    v visualizer    •    space stop    •    q quit"
     } else {
         "↑↓ / j k select    •    1 2 radio    •    e explore    •    s schedule    •    v visualizer    •    space listen    •    q quit"
     };
@@ -1541,9 +1568,9 @@ fn draw_schedule_modal(frame: &mut Frame<'_>, app: &App, compact: bool) {
     render_schedule(frame, channel, sections[1], compact);
     frame.render_widget(
         Paragraph::new(if compact {
-            "s / esc close  •  ↑↓ switch station  •  space play / stop"
+            "s / esc close  •  space play / stop"
         } else {
-            "s / esc close    •    ↑↓ / j k switch station    •    space play / stop"
+            "s / esc close    •    space play / stop"
         })
         .style(Style::default().fg(MUTED)),
         sections[2],
@@ -1645,7 +1672,7 @@ fn draw_explore_modal(frame: &mut Frame<'_>, app: &App, compact: bool) {
         render_explore_list(frame, app, sections[1]);
     }
     frame.render_widget(
-        Paragraph::new("↑↓ / j k browse   •   space / enter listen   •   esc close")
+        Paragraph::new("↑↓ / j k browse   •   space / enter listen   •   e / esc close")
             .style(Style::default().fg(MUTED)),
         sections[2],
     );
@@ -1794,10 +1821,10 @@ fn render_explore_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-/// Draws the wide now-playing card and station rail, returning the card's rect
-/// (used as the selection-sweep area). The card sizes itself to its content
-/// rather than being capped, so long descriptions are shown in full.
-fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+/// Draw the wide now-playing card and station rail. The card sizes itself to
+/// its content rather than being capped, so long descriptions are shown in
+/// full.
+fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect, paint_artwork: bool) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1806,7 +1833,13 @@ fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
             Constraint::Min(34),
         ])
         .split(area);
-    let card = render_now_playing_card(frame, &app.channels[app.selected], columns[0], app.playing);
+    render_now_playing_card(
+        frame,
+        &app.channels[app.selected],
+        columns[0],
+        app.playing,
+        paint_artwork,
+    );
 
     let switcher = Layout::default()
         .direction(Direction::Vertical)
@@ -1832,7 +1865,6 @@ fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
             app.buffering,
         );
     }
-    card
 }
 
 fn draw_compact_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1862,10 +1894,9 @@ fn draw_compact_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(header)), area);
 }
 
-/// Draws the compact now-playing card and returns the rect it occupied (used as
-/// the selection-sweep area). The card grows to fit its copy rather than being
-/// capped to a fixed height, so long descriptions are never truncated.
-fn draw_compact(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+/// Draw the compact now-playing card. It grows to fit its copy rather than
+/// being capped to a fixed height, so long descriptions are never truncated.
+fn draw_compact(frame: &mut Frame<'_>, app: &App, area: Rect, paint_artwork: bool) {
     const ART_WIDTH: u16 = 18;
     const GUTTER: u16 = 2;
     const TEXT_MIN: u16 = 20;
@@ -1912,26 +1943,33 @@ fn draw_compact(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
                 Constraint::Min(TEXT_MIN),
             ])
             .split(now_area);
-        if let Some(artwork) = &selected.artwork {
-            render_artwork(frame, columns[0], artwork);
+        if paint_artwork {
+            if let Some(artwork) = &selected.artwork {
+                render_artwork(frame, columns[0], artwork);
+            }
+        } else {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(SURFACE)),
+                columns[0],
+            );
         }
         let text_rows = now_text_height(selected, columns[2].width, false);
         render_now_text(frame, selected, vcentered(columns[2], text_rows), false);
     } else {
         render_now_text(frame, selected, now_area, false);
     }
-    content
 }
 
-/// Draws the wide now-playing card and returns the rect it occupied. Like the
-/// compact card, it grows to fit its copy instead of being capped, so long show
-/// descriptions are never truncated when there is room below.
+/// Draw the wide now-playing card. Like the compact card, it grows to fit its
+/// copy instead of being capped, so long show descriptions are never
+/// truncated when there is room below.
 fn render_now_playing_card(
     frame: &mut Frame<'_>,
     channel: &Channel,
     area: Rect,
     playing: bool,
-) -> Rect {
+    paint_artwork: bool,
+) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(if playing { SIGNAL } else { BORDER }))
@@ -1978,15 +2016,21 @@ fn render_now_playing_card(
                 Constraint::Min(20),
             ])
             .split(inner);
-        if let Some(artwork) = &channel.artwork {
-            render_artwork(frame, columns[0], artwork);
+        if paint_artwork {
+            if let Some(artwork) = &channel.artwork {
+                render_artwork(frame, columns[0], artwork);
+            }
+        } else {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(SURFACE)),
+                columns[0],
+            );
         }
         let text_rows = now_text_height(channel, columns[2].width, true);
         render_now_text(frame, channel, vcentered(columns[2], text_rows), true);
     } else {
         render_now_text(frame, channel, inner, true);
     }
-    content
 }
 
 fn render_channel_switcher(
@@ -2000,7 +2044,7 @@ fn render_channel_switcher(
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(if selected { SIGNAL } else { BORDER }))
-        .style(Style::default().bg(if selected { SURFACE } else { Color::Reset }))
+        .style(Style::default().bg(if selected { SURFACE } else { BASE }))
         .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2063,59 +2107,71 @@ fn render_now_text(frame: &mut Frame<'_>, channel: &Channel, area: Rect, show_ne
 }
 
 fn now_text_height(channel: &Channel, width: u16, show_next: bool) -> u16 {
-    let description_lines = wrapped_line_count(&channel.description, width);
+    // Use the exact same wrapper that paints the paragraph. The old local
+    // approximation disagreed on Unicode and long words, which could make a
+    // card one row too short and leave its text visually unbalanced.
+    let description_lines = Paragraph::new(channel.description.as_str())
+        .wrap(Wrap { trim: true })
+        .line_count(width)
+        .min(usize::from(u16::MAX)) as u16;
     let next_lines = if show_next && channel.kind == ChannelKind::Live {
         2 // Spacer plus the schedule line.
     } else {
         0
     };
-    2 + description_lines + next_lines
-}
-
-fn wrapped_line_count(value: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut lines = 1u16;
-    let mut line_width = 0usize;
-    for word in value.split_whitespace() {
-        let word_width = word.chars().count();
-        if line_width > 0 && line_width + 1 + word_width > width {
-            lines += 1;
-            line_width = word_width;
-        } else {
-            line_width += usize::from(line_width > 0) + word_width;
-        }
-    }
-    lines
+    2u16.saturating_add(description_lines)
+        .saturating_add(next_lines)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn selecting_while_stopped_changes_only_the_selection() {
-        let mut app = App {
+    fn test_app(selected: usize) -> App {
+        App {
             channels: fallback_channels(),
-            selected: 0,
+            selected,
             explore_selected: 0,
             playing: false,
             buffering: false,
             player: None,
-            effects: EffectManager::default(),
             picker: Picker::halfblocks(),
             now_playing: None,
             visualizer: None,
             view: View::Listen,
             error: None,
             encoded_tx: None,
-        };
+        }
+    }
+
+    fn test_channel_update(
+        index: usize,
+        artwork_url: Option<&str>,
+        artwork: Option<DynamicImage>,
+    ) -> ChannelUpdate {
+        ChannelUpdate {
+            index,
+            show: "Updated show".to_owned(),
+            description: "Updated description".to_owned(),
+            next_show: "Updated next show".to_owned(),
+            next_starts_at: "—".to_owned(),
+            ends_at: None,
+            schedule: None,
+            artwork_url: artwork_url.map(str::to_owned),
+            artwork,
+            stream: None,
+        }
+    }
+
+    #[test]
+    fn selecting_while_stopped_changes_only_the_selection() {
+        let mut app = test_app(0);
 
         app.select_channel(1);
 
         assert_eq!(app.selected, 1);
         assert!(!app.playing);
         assert!(app.player.is_none());
-        assert!(app.effects.is_running());
     }
 
     #[test]
@@ -2187,22 +2243,8 @@ mod tests {
     }
 
     #[test]
-    fn schedule_is_available_only_for_live_channels() {
-        let mut app = App {
-            channels: fallback_channels(),
-            selected: 2,
-            explore_selected: 0,
-            playing: false,
-            buffering: false,
-            player: None,
-            effects: EffectManager::default(),
-            picker: Picker::halfblocks(),
-            now_playing: None,
-            visualizer: None,
-            view: View::Listen,
-            error: None,
-            encoded_tx: None,
-        };
+    fn schedule_is_available_only_for_live_channels_and_keeps_its_station() {
+        let mut app = test_app(2);
 
         app.toggle_schedule();
         assert_eq!(app.view, View::Listen);
@@ -2211,33 +2253,14 @@ mod tests {
         app.selected = 0;
         app.toggle_schedule();
         assert_eq!(app.view, View::Schedule);
-
-        app.selected = 1;
-        app.move_schedule_channel(1);
-        assert_eq!(app.selected, 2);
-        assert_eq!(app.view, View::Listen);
-        assert_eq!(app.channels[app.selected].kind, ChannelKind::Mixtape);
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
     fn explore_is_a_non_disruptive_overlay_until_a_station_is_chosen() {
-        let mut app = App {
-            channels: fallback_channels(),
-            selected: 1,
-            explore_selected: 0,
-            playing: false,
-            buffering: false,
-            player: None,
-            effects: EffectManager::default(),
-            picker: Picker::halfblocks(),
-            now_playing: None,
-            visualizer: None,
-            view: View::Listen,
-            error: None,
-            encoded_tx: None,
-        };
+        let mut app = test_app(1);
 
-        app.open_explore();
+        app.toggle_explore();
         assert_eq!(app.view, View::Explore);
         assert_eq!(app.selected, 1);
 
@@ -2245,6 +2268,55 @@ mod tests {
         app.choose_explore();
         assert_eq!(app.view, View::Listen);
         assert_eq!(app.selected, 4);
+    }
+
+    #[test]
+    fn explore_toggles_without_changing_the_station() {
+        let mut app = test_app(1);
+
+        app.toggle_explore();
+        app.toggle_explore();
+
+        assert_eq!(app.view, View::Listen);
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn schedule_blocks_every_station_change_path() {
+        let mut app = test_app(0);
+        app.toggle_schedule();
+
+        assert!(!app.navigate(1));
+        assert!(!app.change_station(1));
+        app.handle_media_command(MediaCommand::NextStation);
+        app.handle_media_command(MediaCommand::PreviousStation);
+
+        assert_eq!(app.view, View::Schedule);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn invalid_background_channel_updates_are_ignored() {
+        let mut app = test_app(0);
+        let original_show = app.channels[0].show.clone();
+
+        app.apply_channel_updates(vec![test_channel_update(usize::MAX, None, None)]);
+
+        assert_eq!(app.channels[0].show, original_show);
+        assert_eq!(app.channels.len(), 10);
+    }
+
+    #[test]
+    fn failed_artwork_download_is_not_cached_as_loaded() {
+        let mut app = test_app(0);
+
+        app.apply_channel_updates(vec![test_channel_update(
+            0,
+            Some("https://media.ntslive.co.uk/transient.jpg"),
+            None,
+        )]);
+
+        assert!(app.channels[0].artwork_url.is_none());
     }
 
     #[test]

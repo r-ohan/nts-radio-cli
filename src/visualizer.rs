@@ -105,10 +105,6 @@ fn field(x: f32, y: f32, time: f32, parameters: [f32; 8]) -> f32 {
     let grain = ((x * (29.0 + texture * 31.0) + y * (13.0 + density * 19.0) + time * 2.0).sin()
         + 1.0)
         * (0.035 + texture * 0.10);
-    let scanner_y =
-        (time * (0.055 + drift * 0.065) + phase / std::f32::consts::TAU).rem_euclid(1.15) - 0.075;
-    let scanner =
-        (1.0 - (y - scanner_y).abs() * (18.0 + contrast * 18.0)).max(0.0) * (0.38 + texture * 0.30);
     let tracers = (1.0
         - ((x * (12.0 + density * 15.0) + y * (4.0 + curve * 6.0) - time * 1.4 + phase)
             .sin()
@@ -117,11 +113,7 @@ fn field(x: f32, y: f32, time: f32, parameters: [f32; 8]) -> f32 {
         .max(0.0)
         * 0.24;
 
-    ribbons
-        .max(ring * (0.35 + orbit * 0.55))
-        .max(scanner)
-        .max(tracers)
-        + grain
+    ribbons.max(ring * (0.35 + orbit * 0.55)).max(tracers) + grain
 }
 
 fn braille_dot(x: usize, y: usize) -> u8 {
