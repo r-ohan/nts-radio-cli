@@ -1,6 +1,10 @@
 use std::sync::mpsc::Sender;
 
 #[derive(Clone, Copy, Debug)]
+// These commands are produced by macOS's remote-command center. Other
+// platforms deliberately provide a no-op Now Playing implementation, so the
+// variants are unused there but remain part of the shared application API.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum MediaCommand {
     TogglePlayback,
     Play,
