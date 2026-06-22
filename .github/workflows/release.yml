@@ -35,7 +35,7 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.archive }}
 
-  publish:
+  github-release:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -46,3 +46,57 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.tar.gz
+
+  # Publishes the source crate. Requires the CARGO_REGISTRY_TOKEN repo secret
+  # (a crates.io API token with the publish-update scope).
+  crates-io:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.+)"/\1/')
+          echo "tag=$tag cargo=$crate"
+          [ "$tag" = "$crate" ] || { echo "::error::Tag $tag does not match Cargo.toml version $crate"; exit 1; }
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Points the Homebrew tap at the new release. Requires the HOMEBREW_TAP_TOKEN
+  # repo secret (a GitHub token with push access to r-ohan/homebrew-nts; the
+  # default GITHUB_TOKEN cannot push to another repository). Skips cleanly if
+  # the secret is absent.
+  homebrew:
+    name: Bump Homebrew formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update r-ohan/homebrew-nts formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping formula bump."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${version}.tar.gz"
+          # GitHub's source tarball can lag the tag push by a few seconds.
+          for _ in $(seq 1 12); do
+            if curl -sfL "$url" -o src.tar.gz && [ -s src.tar.gz ]; then break; fi
+            sleep 5
+          done
+          [ -s src.tar.gz ] || { echo "::error::source tarball not available at $url"; exit 1; }
+          sha=$(sha256sum src.tar.gz | awk '{print $1}')
+          echo "version=$version sha256=$sha"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/r-ohan/homebrew-nts.git" tap
+          cd tap
+          sed -i -E "s#^( *url +)\".*\"#\1\"${url}\"#" Formula/nts.rb
+          sed -i -E "s#^( *sha256 +)\".*\"#\1\"${sha}\"#" Formula/nts.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "nts ${version}"
+          git push
