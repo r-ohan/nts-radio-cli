@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fs, io,
     io::Write,
     os::unix::net::UnixStream,
@@ -18,7 +19,7 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     },
 };
-use image::{DynamicImage, imageops::FilterType};
+use image::DynamicImage;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -28,8 +29,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use ratatui_image::{
-    FontSize, Image, Resize,
-    picker::{Picker, ProtocolType},
+    Resize, StatefulImage,
+    picker::Picker,
+    protocol::StatefulProtocol,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -85,9 +87,10 @@ struct Channel {
     ends_at: Option<String>,
     schedule: Vec<ScheduleEntry>,
     artwork_url: Option<String>,
-    artwork_primary: Option<ratatui_image::protocol::Protocol>,
-    artwork_primary_size: Option<Size>,
-    artwork_compact: Option<ratatui_image::protocol::Protocol>,
+    // A single resize-on-render protocol fits any card, so there is no fixed
+    // encoding to mismatch a layout. RefCell because rendering needs `&mut` to
+    // re-encode on resize while the draw path holds the app immutably.
+    artwork: Option<RefCell<StatefulProtocol>>,
 }
 
 struct App {
@@ -141,17 +144,9 @@ struct ChannelUpdate {
     ends_at: Option<String>,
     schedule: Option<Vec<ScheduleEntry>>,
     artwork_url: Option<String>,
-    artwork: Option<ArtworkProtocols>,
+    // Downloaded and landscape-cropped off-thread; encoded lazily at render.
+    artwork: Option<DynamicImage>,
     stream: Option<String>,
-}
-
-/// Terminal-ready artwork. The Lanczos3 resize and protocol encoding are the
-/// expensive part of an artwork update, so they are built on the worker thread
-/// and the finished protocols handed to the UI thread for a cheap assignment.
-struct ArtworkProtocols {
-    primary: Option<ratatui_image::protocol::Protocol>,
-    primary_size: Size,
-    compact: Option<ratatui_image::protocol::Protocol>,
 }
 
 struct ScheduleUpdate {
@@ -279,6 +274,7 @@ impl App {
     }
 
     fn apply_channel_updates(&mut self, updates: Vec<ChannelUpdate>) {
+        let picker = self.picker.clone();
         for update in updates {
             let channel = &mut self.channels[update.index];
             channel.show = update.show;
@@ -293,10 +289,8 @@ impl App {
             if let Some(stream) = update.stream {
                 channel.stream = stream;
             }
-            if let Some(artwork) = update.artwork {
-                channel.artwork_primary = artwork.primary;
-                channel.artwork_primary_size = Some(artwork.primary_size);
-                channel.artwork_compact = artwork.compact;
+            if let Some(image) = update.artwork {
+                channel.artwork = Some(RefCell::new(picker.new_resize_protocol(image)));
             }
         }
     }
@@ -679,9 +673,7 @@ fn fallback_channels() -> Vec<Channel> {
             ends_at: None,
             schedule: Vec::new(),
             artwork_url: None,
-            artwork_primary: None,
-            artwork_primary_size: None,
-            artwork_compact: None,
+            artwork: None,
         },
         Channel {
             number: "2",
@@ -695,9 +687,7 @@ fn fallback_channels() -> Vec<Channel> {
             ends_at: None,
             schedule: Vec::new(),
             artwork_url: None,
-            artwork_primary: None,
-            artwork_primary_size: None,
-            artwork_compact: None,
+            artwork: None,
         },
         mixtape_channel(
             "Poolside",
@@ -755,16 +745,11 @@ fn mixtape_channel(name: &'static str, label: &'static str, stream: &'static str
         ends_at: None,
         schedule: Vec::new(),
         artwork_url: None,
-        artwork_primary: None,
-        artwork_primary_size: None,
-        artwork_compact: None,
+        artwork: None,
     }
 }
 
-fn fetch_live_updates(
-    picker: &Picker,
-    known_artwork_urls: Vec<Option<String>>,
-) -> Result<Vec<ChannelUpdate>> {
+fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let live: LiveResponse = client.get(LIVE_API).send()?.error_for_status()?.json()?;
     let mut updates = Vec::with_capacity(2);
@@ -793,7 +778,7 @@ fn fetch_live_updates(
             artwork_url
                 .as_deref()
                 .and_then(|url| fetch_image(&client, url).ok())
-                .and_then(|image| build_artwork(picker, &image))
+                .map(crop_to_landscape)
         } else {
             None
         };
@@ -845,10 +830,7 @@ fn fetch_schedule_updates() -> Result<Vec<ScheduleUpdate>> {
     Ok(updates)
 }
 
-fn fetch_mixtape_updates(
-    picker: &Picker,
-    known_artwork_urls: Vec<Option<String>>,
-) -> Result<Vec<ChannelUpdate>> {
+fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
     const MIXTAPES: [&str; 8] = [
         "poolside",
         "slow-focus",
@@ -874,7 +856,7 @@ fn fetch_mixtape_updates(
             artwork_url
                 .as_deref()
                 .and_then(|url| fetch_image(&client, url).ok())
-                .and_then(|image| build_artwork(picker, &image))
+                .map(crop_to_landscape)
         } else {
             None
         };
@@ -953,41 +935,19 @@ fn fetch_image(client: &Client, url: &str) -> Result<DynamicImage> {
     image::load_from_memory(&bytes).context("decode NTS artwork")
 }
 
-fn build_artwork(picker: &Picker, image: &DynamicImage) -> Option<ArtworkProtocols> {
-    // Halfblocks render straight from the cell buffer, so there is no protocol
-    // to precompute. Skip the work and let the UI fall back to text.
-    if picker.protocol_type() == ProtocolType::Halfblocks {
-        return None;
+/// Center-crop to NTS's landscape aspect. The cards are artwork-led and expect
+/// a consistent landscape crop; the resize protocol then scales this to fit
+/// whatever cell area it is rendered into.
+fn crop_to_landscape(image: DynamicImage) -> DynamicImage {
+    let (width, height) = (image.width(), image.height());
+    let target_height = ((width as f32) / NTS_ARTWORK_ASPECT).round() as u32;
+    if target_height <= height {
+        image.crop_imm(0, (height - target_height) / 2, width, target_height.max(1))
+    } else {
+        let target_width = ((height as f32) * NTS_ARTWORK_ASPECT).round() as u32;
+        let target_width = target_width.clamp(1, width);
+        image.crop_imm((width - target_width) / 2, 0, target_width, height)
     }
-    // The wide card is deliberately artwork-led: at 56 cells this fills its
-    // usable height while retaining NTS's landscape crop.
-    let primary_size = nts_artwork_size(picker.font_size(), 56);
-    let compact_size = nts_artwork_size(picker.font_size(), 16);
-    let primary = artwork_to_cells(image, picker.font_size(), primary_size);
-    let compact = artwork_to_cells(image, picker.font_size(), compact_size);
-    Some(ArtworkProtocols {
-        primary: picker
-            .new_protocol(primary, primary_size, Resize::Fit(None))
-            .ok(),
-        primary_size,
-        compact: picker
-            .new_protocol(compact, compact_size, Resize::Fit(None))
-            .ok(),
-    })
-}
-
-fn artwork_to_cells(image: &DynamicImage, font_size: FontSize, cells: Size) -> DynamicImage {
-    let width = u32::from(cells.width) * u32::from(font_size.width);
-    let height = u32::from(cells.height) * u32::from(font_size.height);
-    image.resize_to_fill(width.max(1), height.max(1), FilterType::Lanczos3)
-}
-
-fn nts_artwork_size(font_size: FontSize, width_cells: u16) -> Size {
-    let pixel_width = f32::from(width_cells) * f32::from(font_size.width);
-    let height_cells = (pixel_width / (NTS_ARTWORK_ASPECT * f32::from(font_size.height)))
-        .round()
-        .max(1.0) as u16;
-    Size::new(width_cells, height_cells)
 }
 
 fn launch_player(stream: &str) -> Result<Player> {
@@ -1020,13 +980,12 @@ fn drain_startup_responses() -> Result<()> {
 
 fn request_live_refresh(
     sender: &mpsc::Sender<BackgroundUpdate>,
-    picker: Picker,
     artwork_urls: Vec<Option<String>>,
 ) {
     let sender = sender.clone();
     thread::spawn(move || {
         let _ = sender.send(BackgroundUpdate::Live(
-            fetch_live_updates(&picker, artwork_urls).map_err(|error| error.to_string()),
+            fetch_live_updates(artwork_urls).map_err(|error| error.to_string()),
         ));
     });
 }
@@ -1042,13 +1001,12 @@ fn request_schedule_refresh(sender: &mpsc::Sender<BackgroundUpdate>) {
 
 fn request_mixtape_refresh(
     sender: &mpsc::Sender<BackgroundUpdate>,
-    picker: Picker,
     artwork_urls: Vec<Option<String>>,
 ) {
     let sender = sender.clone();
     thread::spawn(move || {
         let _ = sender.send(BackgroundUpdate::Mixtapes(
-            fetch_mixtape_updates(&picker, artwork_urls).map_err(|error| error.to_string()),
+            fetch_mixtape_updates(artwork_urls).map_err(|error| error.to_string()),
         ));
     });
 }
@@ -1069,12 +1027,12 @@ fn run(
     // with fallback copy so this first frame is already drawn and interactive;
     // the real show titles and artwork arrive via `BackgroundUpdate::Live`.
     let mut refresh_in_flight = true;
-    request_live_refresh(&update_tx, app.picker.clone(), app.artwork_urls());
+    request_live_refresh(&update_tx, app.artwork_urls());
     let mut next_refresh = Instant::now() + app.next_refresh_delay();
     let mut next_schedule_refresh = Instant::now();
     let mut next_player_probe = Instant::now() + Duration::from_millis(300);
 
-    request_mixtape_refresh(&update_tx, app.picker.clone(), app.artwork_urls());
+    request_mixtape_refresh(&update_tx, app.artwork_urls());
     loop {
         let now = Instant::now();
         while let Ok(command) = media_rx.try_recv() {
@@ -1127,7 +1085,7 @@ fn run(
         if !refresh_in_flight && now >= next_refresh {
             next_refresh = now + Duration::from_secs(60);
             refresh_in_flight = true;
-            request_live_refresh(&update_tx, app.picker.clone(), app.artwork_urls());
+            request_live_refresh(&update_tx, app.artwork_urls());
         }
         if !schedule_in_flight && now >= next_schedule_refresh {
             next_schedule_refresh = now + Duration::from_secs(15 * 60);
@@ -1313,7 +1271,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
             ])
             .split(area);
         draw_compact_header(frame, app, main[0]);
-        draw_compact(frame, app, main[1]);
+        let card = draw_compact(frame, app, main[1]);
         render_footer(frame, app, main[2], true);
         render_error(frame, app, main[2]);
         match app.view {
@@ -1321,7 +1279,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
             View::Explore => draw_explore_modal(frame, app, true),
             View::Listen => {}
         }
-        return compact_animation_area(main[1]);
+        return card;
     }
 
     let main = Layout::default()
@@ -1353,7 +1311,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
         main[1],
     );
 
-    draw_wide_channels(frame, app, main[2]);
+    let card = draw_wide_channels(frame, app, main[2]);
     render_footer(frame, app, main[3], false);
     render_error(frame, app, main[3]);
     match app.view {
@@ -1362,7 +1320,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
         View::Listen => {}
     }
 
-    wide_animation_area(main[2])
+    card
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, compact: bool) {
@@ -1644,6 +1602,30 @@ fn render_explore_grid(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
+/// Render artwork scaled to fill `area` (preserving aspect) and vertically
+/// centered. `Scale` resizes up or down — unlike `Fit`, which would cap a
+/// small source at its native pixel size and leave the card half-empty.
+fn render_artwork(frame: &mut Frame<'_>, area: Rect, artwork: &RefCell<StatefulProtocol>) {
+    let mut protocol = artwork.borrow_mut();
+    let fitted = protocol.size_for(Resize::Scale(None), Size::new(area.width, area.height));
+    let area = vcentered(area, fitted.height);
+    frame.render_stateful_widget(
+        StatefulImage::new().resize(Resize::Scale(None)),
+        area,
+        &mut *protocol,
+    );
+}
+
+/// Shrink `area` to `height` rows, centered within the original vertical span.
+fn vcentered(area: Rect, height: u16) -> Rect {
+    let height = height.min(area.height);
+    Rect {
+        y: area.y + area.height.saturating_sub(height) / 2,
+        height,
+        ..area
+    }
+}
+
 fn render_explore_tile(frame: &mut Frame<'_>, channel: &Channel, area: Rect, selected: bool) {
     let block = Block::default()
         .borders(Borders::LEFT)
@@ -1659,8 +1641,8 @@ fn render_explore_tile(frame: &mut Frame<'_>, channel: &Channel, area: Rect, sel
             Constraint::Min(12),
         ])
         .split(inner);
-    if let Some(artwork) = &channel.artwork_compact {
-        frame.render_widget(Image::new(artwork), columns[0]);
+    if let Some(artwork) = &channel.artwork {
+        render_artwork(frame, columns[0], artwork);
     }
     let marker = if selected { "→ " } else { "  " };
     frame.render_widget(
@@ -1721,20 +1703,10 @@ fn render_explore_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn wide_animation_area(area: Rect) -> Rect {
-    let content = wide_content_area(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(64),
-            Constraint::Length(2),
-            Constraint::Min(34),
-        ])
-        .split(content)[0]
-}
-
-fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let content = wide_content_area(area);
+/// Draws the wide now-playing card and station rail, returning the card's rect
+/// (used as the selection-sweep area). The card sizes itself to its content
+/// rather than being capped, so long descriptions are shown in full.
+fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1742,8 +1714,8 @@ fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Constraint::Length(2),
             Constraint::Min(34),
         ])
-        .split(content);
-    render_now_playing_card(frame, &app.channels[app.selected], columns[0], app.playing);
+        .split(area);
+    let card = render_now_playing_card(frame, &app.channels[app.selected], columns[0], app.playing);
 
     let switcher = Layout::default()
         .direction(Direction::Vertical)
@@ -1769,20 +1741,7 @@ fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) {
             app.buffering,
         );
     }
-}
-
-fn wide_content_area(area: Rect) -> Rect {
-    Rect {
-        height: area.height.min(20),
-        ..area
-    }
-}
-
-fn compact_animation_area(area: Rect) -> Rect {
-    Rect {
-        height: area.height.min(8),
-        ..area
-    }
+    card
 }
 
 fn draw_compact_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1812,50 +1771,114 @@ fn draw_compact_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(header)), area);
 }
 
-fn draw_compact(frame: &mut Frame<'_>, app: &App, area: Rect) {
+/// Draws the compact now-playing card and returns the rect it occupied (used as
+/// the selection-sweep area). The card grows to fit its copy rather than being
+/// capped to a fixed height, so long descriptions are never truncated.
+fn draw_compact(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    const ART_WIDTH: u16 = 18;
+    const GUTTER: u16 = 2;
+    const TEXT_MIN: u16 = 20;
+
+    let selected = &app.channels[app.selected];
+    // The inner width sits past the left border (1) and left padding (2).
+    let inner_width = area.width.saturating_sub(3);
+    let show_art = selected.artwork.is_some() && inner_width >= ART_WIDTH + GUTTER + TEXT_MIN;
+    let text_width = if show_art {
+        inner_width.saturating_sub(ART_WIDTH + GUTTER)
+    } else {
+        inner_width
+    };
+
+    let text_rows = now_text_height(selected, text_width, false);
+    let art_rows = if show_art {
+        selected.artwork.as_ref().map_or(0, |artwork| {
+            artwork
+                .borrow()
+                .size_for(Resize::Scale(None), Size::new(ART_WIDTH, area.height))
+                .height
+        })
+    } else {
+        0
+    };
     let content = Rect {
-        height: area.height.min(8),
+        height: text_rows.max(art_rows).clamp(1, area.height),
         ..area
     };
 
-    let selected = &app.channels[app.selected];
-    let now = Block::default()
+    let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(SIGNAL))
         .padding(ratatui::widgets::Padding::left(2));
-    let now_area = now.inner(content);
-    frame.render_widget(now, content);
+    let now_area = block.inner(content);
+    frame.render_widget(block, content);
 
-    if let Some(artwork) = &selected.artwork_compact
-        && now_area.width >= 44
-        && now_area.height >= 5
-    {
+    if show_art {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(18),
-                Constraint::Length(2),
-                Constraint::Min(20),
+                Constraint::Length(ART_WIDTH),
+                Constraint::Length(GUTTER),
+                Constraint::Min(TEXT_MIN),
             ])
             .split(now_area);
-        frame.render_widget(Image::new(artwork), columns[0]);
-        render_now_text(frame, selected, columns[2], false);
+        if let Some(artwork) = &selected.artwork {
+            render_artwork(frame, columns[0], artwork);
+        }
+        let text_rows = now_text_height(selected, columns[2].width, false);
+        render_now_text(frame, selected, vcentered(columns[2], text_rows), false);
     } else {
         render_now_text(frame, selected, now_area, false);
     }
+    content
 }
 
-fn render_now_playing_card(frame: &mut Frame<'_>, channel: &Channel, area: Rect, playing: bool) {
+/// Draws the wide now-playing card and returns the rect it occupied. Like the
+/// compact card, it grows to fit its copy instead of being capped, so long show
+/// descriptions are never truncated when there is room below.
+fn render_now_playing_card(
+    frame: &mut Frame<'_>,
+    channel: &Channel,
+    area: Rect,
+    playing: bool,
+) -> Rect {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(if playing { SIGNAL } else { BORDER }))
         .style(Style::default().bg(SURFACE))
         .padding(ratatui::widgets::Padding::new(2, 2, 1, 1));
+    // Widths are independent of height, so measure them against the full area.
     let inner = block.inner(area);
-    frame.render_widget(block, area);
+    // The artwork resizes itself to whatever column it gets, so we just pick a
+    // width that scales with the card and keep a 20-cell minimum for the copy.
+    let artwork_width = inner.width.saturating_sub(24).clamp(20, 56);
+    let show_art = channel.artwork.is_some() && inner.width >= artwork_width + 23;
+    let text_width = if show_art {
+        inner.width.saturating_sub(artwork_width + 3)
+    } else {
+        inner.width
+    };
 
-    if let Some(artwork) = &channel.artwork_primary {
-        let artwork_width = inner.width.saturating_sub(24).clamp(30, 56);
+    let text_rows = now_text_height(channel, text_width, true);
+    let art_rows = if show_art {
+        channel.artwork.as_ref().map_or(0, |artwork| {
+            artwork
+                .borrow()
+                .size_for(Resize::Scale(None), Size::new(artwork_width, area.height))
+                .height
+        })
+    } else {
+        0
+    };
+    // +2 for the block's top and bottom padding.
+    let content = Rect {
+        height: (text_rows.max(art_rows) + 2).clamp(3, area.height),
+        ..area
+    };
+
+    let inner = block.inner(content);
+    frame.render_widget(block, content);
+
+    if show_art {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1864,26 +1887,15 @@ fn render_now_playing_card(frame: &mut Frame<'_>, channel: &Channel, area: Rect,
                 Constraint::Min(20),
             ])
             .split(inner);
-        let artwork_size = channel
-            .artwork_primary_size
-            .unwrap_or_else(|| Size::new(columns[0].width, columns[0].height));
-        let artwork_height = artwork_size.height.min(columns[0].height);
-        let artwork_area = Rect {
-            y: columns[0].y + columns[0].height.saturating_sub(artwork_height) / 2,
-            height: artwork_height,
-            ..columns[0]
-        };
-        frame.render_widget(Image::new(artwork), artwork_area);
-        let text_height = now_text_height(channel, columns[2].width, true).min(columns[2].height);
-        let text_area = Rect {
-            y: artwork_area.y + artwork_area.height.saturating_sub(text_height) / 2,
-            height: text_height,
-            ..columns[2]
-        };
-        render_now_text(frame, channel, text_area, true);
+        if let Some(artwork) = &channel.artwork {
+            render_artwork(frame, columns[0], artwork);
+        }
+        let text_rows = now_text_height(channel, columns[2].width, true);
+        render_now_text(frame, channel, vcentered(columns[2], text_rows), true);
     } else {
         render_now_text(frame, channel, inner, true);
     }
+    content
 }
 
 fn render_channel_switcher(
@@ -2016,12 +2028,14 @@ mod tests {
 
     #[test]
     fn artwork_is_cropped_to_nts_landscape_aspect_ratio() {
-        let source = DynamicImage::new_rgba8(320, 180);
-        let size = nts_artwork_size(FontSize::new(8, 16), 32);
-        let artwork = artwork_to_cells(&source, FontSize::new(8, 16), size);
+        let cropped = crop_to_landscape(DynamicImage::new_rgba8(400, 400));
+        let ratio = cropped.width() as f32 / cropped.height() as f32;
 
-        assert_eq!((size.width, size.height), (32, 10));
-        assert_eq!((artwork.width(), artwork.height()), (256, 160));
+        assert_eq!(cropped.width(), 400);
+        assert!(
+            (ratio - NTS_ARTWORK_ASPECT).abs() < 0.02,
+            "aspect ratio {ratio} should match {NTS_ARTWORK_ASPECT}"
+        );
     }
 
     #[test]
