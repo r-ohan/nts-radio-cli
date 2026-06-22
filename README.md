@@ -1,66 +1,67 @@
 # nts
 
-An unofficial, rich terminal home for [NTS Radio](https://www.nts.live), built with Rust, Ratatui, and `ratatui-image`.
+### NTS Radio, in your terminal.
 
-Listen to NTS 1 and NTS 2, browse eight Infinite Mixtapes, see the current show and local-time schedule, and discover a little braille visualizer. In terminals with an image protocol, it renders the actual show artwork without compromising the layout.
+`nts` is an unofficial NTS Radio player for the terminal, written in Rust.
+Listen live, move between stations without interrupting playback, see what is
+on now and next in your local time, and disappear into the Infinite Mixtapes.
 
-`mpv` stays running while you browse: station changes reuse the player process rather than restart it.
-
-> NTS is a trademark of NTS. This is an independent, unofficial client and is not affiliated with NTS.
-
-## Features
-
-- Starts NTS 1 on launch; switch stations without stopping playback.
-- Live now-playing metadata, scheduled handovers, and local-time schedules.
-- Eight NTS Infinite Mixtapes in a dedicated Explore overlay.
-- Native macOS Now Playing integration and media-key controls.
-- Artwork via Kitty, iTerm2, and Sixel terminal graphics protocols.
-- A responsive compact layout, plus a hidden `v` visualizer moment.
+It starts with NTS 1. The rest is yours to find.
 
 ## Install
 
-Install from the Homebrew tap:
-
 ```sh
 brew install r-ohan/nts/nts
-nts
 ```
 
-Or install directly from source:
+Or add the tap once, then use the short name:
 
 ```sh
-brew install mpv
+brew tap r-ohan/nts
+brew trust r-ohan/nts
+brew install nts
+```
+
+`mpv` is installed automatically by Homebrew. To build from source, install
+Rust 1.85+ and `mpv`, then run:
+
+```sh
 cargo install --git https://github.com/r-ohan/nts-radio-cli.git
 ```
 
-The formula installs `mpv` automatically. Source installs require Rust 1.85+ and `mpv`.
+## Inside
 
-## Controls
+- NTS 1, NTS 2, and eight Infinite Mixtapes.
+- Live show details, next-up information, and schedules in your local time.
+- Artwork in image-capable terminals; a clean text-first experience everywhere else.
+- A layout that adapts from a small terminal to a full-screen listening room.
+- macOS Now Playing and media-key support.
+- One hidden visualizer, for when the room needs to get a little stranger.
+
+## Keys
 
 | Key | Action |
 | --- | --- |
-| `space` / `enter` | play or stop; in Explore, listen to the highlighted station |
-| `1`, `2` | select or change to a radio station |
-| `↑↓`, `j k` | move selection / change station while listening |
-| `e` | open Infinite Mixtapes Explore |
-| `s` | toggle the selected live channel's local-time schedule |
+| `space` / `enter` | listen or stop; choose a station in Explore |
+| `↑↓` / `j k` | change station or browse Explore |
+| `1` / `2` | jump to NTS 1 or NTS 2 |
+| `e` | open or close Explore |
+| `s` | open or close the live schedule |
 | `v` | open or close the visualizer |
-| `esc` | close Schedule or Explore; quit from the main view |
+| `esc` | close the current overlay; quit from the main view |
 | `q` | quit |
 
-## Playback and metadata
+## Notes
 
-Playback requires `mpv`; it is controlled through its local JSON IPC socket so a channel change can use `loadfile … replace` in the existing player process. The new station still has to establish its own network stream, but process startup is no longer part of the wait. `nts` queries mpv's playback state, surfaces stream startup as buffering, and will make one clean reconnect attempt if the player disappears.
+Artwork appears in terminals with Kitty, iTerm2, or Sixel image support—such
+as Ghostty, iTerm2, Kitty, and WezTerm. It is intentionally omitted in
+text-only terminals rather than turned into an ugly raster.
 
-On macOS, `nts` also publishes the current show to the system Now Playing interface. System play/pause and next/previous commands control the same active station session.
+NTS publishes the direct live streams and public schedule metadata used by the
+app. See NTS’s [listening guide](https://ntslive.freshdesk.com/support/solutions/articles/77000587257-tunein).
 
-NTS's live metadata occasionally lags a handover. `nts` reconciles the timestamped broadcasts locally and refreshes at handover boundaries, so the current show and the schedule remain correct in your local timezone.
-
-## Artwork
-
-The app uses `ratatui-image` to query the terminal’s image capabilities and map artwork to its layout rectangle. The Kitty, iTerm2, and Sixel graphics protocols are supported, so terminals like Ghostty, iTerm2, Kitty, and WezTerm display cover art. On a text-only terminal, artwork is deliberately omitted rather than reduced to an ugly text raster.
-
-NTS publishes the direct NTS 1 and NTS 2 streams in its [support documentation](https://ntslive.freshdesk.com/support/solutions/articles/77000587257-tunein). The app uses NTS’s public live endpoint for display metadata.
+`nts` is independent and unofficial. NTS is a trademark of NTS and this
+project is not affiliated with or endorsed by NTS.
 
 ## Development
 
@@ -72,4 +73,4 @@ cargo run --release
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE)
