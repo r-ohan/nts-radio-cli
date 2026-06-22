@@ -32,6 +32,7 @@ use ratatui_image::{
     Resize, StatefulImage,
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
+    thread::{ResizeRequest, ResizeResponse, ThreadProtocol},
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -87,10 +88,11 @@ struct Channel {
     ends_at: Option<String>,
     schedule: Vec<ScheduleEntry>,
     artwork_url: Option<String>,
-    // A single resize-on-render protocol fits any card, so there is no fixed
-    // encoding to mismatch a layout. RefCell because rendering needs `&mut` to
-    // re-encode on resize while the draw path holds the app immutably.
-    artwork: Option<RefCell<StatefulProtocol>>,
+    // Resize+encode is offloaded to a per-channel worker thread (see `run`), so
+    // the draw pass never blocks: the protocol resizes itself to any card and
+    // the encoded result lands a frame later. RefCell because rendering needs
+    // `&mut` while the draw path holds the app immutably.
+    artwork: Option<RefCell<ThreadProtocol>>,
 }
 
 struct App {
@@ -106,6 +108,9 @@ struct App {
     visualizer: Option<LiveVisualizer>,
     view: View,
     error: Option<String>,
+    // Workers send (channel index, encoded protocol) back here. Set in `run`;
+    // `None` outside the event loop (e.g. tests), where artwork is never built.
+    encoded_tx: Option<mpsc::Sender<(usize, ResizeResponse)>>,
 }
 
 struct Player {
@@ -242,6 +247,7 @@ impl App {
             visualizer: None,
             view: View::Listen,
             error: None,
+            encoded_tx: None,
         };
         app.animate_selection();
         app
@@ -275,11 +281,13 @@ impl App {
 
     fn apply_channel_updates(&mut self, updates: Vec<ChannelUpdate>) {
         let picker = self.picker.clone();
+        let encoded_tx = self.encoded_tx.clone();
         // On a text-only terminal we deliberately omit artwork rather than fall
         // back to a half-block raster (see README). Skip building the protocol.
         let supports_artwork = picker.protocol_type() != ProtocolType::Halfblocks;
         for update in updates {
-            let channel = &mut self.channels[update.index];
+            let index = update.index;
+            let channel = &mut self.channels[index];
             channel.show = update.show;
             channel.description = update.description;
             channel.next_show = update.next_show;
@@ -292,8 +300,22 @@ impl App {
             if let Some(stream) = update.stream {
                 channel.stream = stream;
             }
-            if supports_artwork && let Some(image) = update.artwork {
-                channel.artwork = Some(RefCell::new(picker.new_resize_protocol(image)));
+            if supports_artwork
+                && let Some(image) = update.artwork
+                && let Some(encoded_tx) = &encoded_tx
+            {
+                let protocol = picker.new_resize_protocol(image);
+                match &channel.artwork {
+                    // A refresh of an already-shown channel: swap in the new
+                    // image; the existing worker re-encodes on the next draw.
+                    Some(artwork) => artwork.borrow_mut().replace_protocol(protocol),
+                    // First artwork for this channel: spin up its encode worker.
+                    None => {
+                        channel.artwork = Some(RefCell::new(spawn_artwork_worker(
+                            index, protocol, encoded_tx,
+                        )));
+                    }
+                }
             }
         }
     }
@@ -981,6 +1003,27 @@ fn drain_startup_responses() -> Result<()> {
     Ok(())
 }
 
+/// Create a [`ThreadProtocol`] backed by a dedicated worker thread that resizes
+/// and encodes artwork off the UI thread. Each encoded result is tagged with
+/// `index` so the event loop can route it back to the right channel. The worker
+/// exits when the channel's `ThreadProtocol` (and thus its sender) is dropped.
+fn spawn_artwork_worker(
+    index: usize,
+    protocol: StatefulProtocol,
+    encoded_tx: &mpsc::Sender<(usize, ResizeResponse)>,
+) -> ThreadProtocol {
+    let (request_tx, request_rx) = mpsc::channel::<ResizeRequest>();
+    let encoded_tx = encoded_tx.clone();
+    thread::spawn(move || {
+        while let Ok(request) = request_rx.recv() {
+            if let Ok(response) = request.resize_encode() {
+                let _ = encoded_tx.send((index, response));
+            }
+        }
+    });
+    ThreadProtocol::new(request_tx, Some(protocol))
+}
+
 fn request_live_refresh(
     sender: &mpsc::Sender<BackgroundUpdate>,
     artwork_urls: Vec<Option<String>>,
@@ -1025,6 +1068,10 @@ fn run(
     let mut title_dirty = true;
     let mut next_title_tick = Instant::now();
     let (update_tx, update_rx) = mpsc::channel::<BackgroundUpdate>();
+    // Per-channel encode workers resize+encode artwork off the UI thread and
+    // send the finished protocol back here, keeping the draw pass non-blocking.
+    let (encoded_tx, encoded_rx) = mpsc::channel::<(usize, ResizeResponse)>();
+    app.encoded_tx = Some(encoded_tx);
     let mut schedule_in_flight = false;
     // Fetch live data on a background thread right away. `App::load` returns
     // with fallback copy so this first frame is already drawn and interactive;
@@ -1046,6 +1093,13 @@ fn run(
         }
         if app.poll_visualizer() {
             dirty = true;
+        }
+        while let Ok((index, response)) = encoded_rx.try_recv() {
+            if let Some(artwork) = app.channels.get(index).and_then(|c| c.artwork.as_ref())
+                && artwork.borrow_mut().update_resized_protocol(response)
+            {
+                dirty = true;
+            }
         }
         if title_dirty || (app.playing && now >= next_title_tick) {
             if app.playing {
@@ -1608,9 +1662,14 @@ fn render_explore_grid(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// Render artwork scaled to fill `area` (preserving aspect) and vertically
 /// centered. `Scale` resizes up or down — unlike `Fit`, which would cap a
 /// small source at its native pixel size and leave the card half-empty.
-fn render_artwork(frame: &mut Frame<'_>, area: Rect, artwork: &RefCell<StatefulProtocol>) {
+fn render_artwork(frame: &mut Frame<'_>, area: Rect, artwork: &RefCell<ThreadProtocol>) {
     let mut protocol = artwork.borrow_mut();
-    let fitted = protocol.size_for(Resize::Scale(None), Size::new(area.width, area.height));
+    // `size_for` is `None` while no encoded image is ready (initial encode or a
+    // pending resize). Draw nothing this frame; the worker's result arrives soon.
+    let Some(fitted) = protocol.size_for(Resize::Scale(None), Size::new(area.width, area.height))
+    else {
+        return;
+    };
     let area = vcentered(area, fitted.height);
     frame.render_stateful_widget(
         StatefulImage::new().resize(Resize::Scale(None)),
@@ -1798,7 +1857,7 @@ fn draw_compact(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
             artwork
                 .borrow()
                 .size_for(Resize::Scale(None), Size::new(ART_WIDTH, area.height))
-                .height
+                .map_or(0, |size| size.height)
         })
     } else {
         0
@@ -1867,7 +1926,7 @@ fn render_now_playing_card(
             artwork
                 .borrow()
                 .size_for(Resize::Scale(None), Size::new(artwork_width, area.height))
-                .height
+                .map_or(0, |size| size.height)
         })
     } else {
         0
@@ -2019,6 +2078,7 @@ mod tests {
             visualizer: None,
             view: View::Listen,
             error: None,
+            encoded_tx: None,
         };
 
         app.select_channel(1);
@@ -2112,6 +2172,7 @@ mod tests {
             visualizer: None,
             view: View::Listen,
             error: None,
+            encoded_tx: None,
         };
 
         app.toggle_schedule();
@@ -2144,6 +2205,7 @@ mod tests {
             visualizer: None,
             view: View::Listen,
             error: None,
+            encoded_tx: None,
         };
 
         app.open_explore();
