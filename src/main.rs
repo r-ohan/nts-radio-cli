@@ -86,6 +86,7 @@ struct Channel {
     schedule: Vec<ScheduleEntry>,
     artwork_url: Option<String>,
     artwork_primary: Option<ratatui_image::protocol::Protocol>,
+    artwork_primary_size: Option<Size>,
     artwork_compact: Option<ratatui_image::protocol::Protocol>,
 }
 
@@ -140,8 +141,17 @@ struct ChannelUpdate {
     ends_at: Option<String>,
     schedule: Option<Vec<ScheduleEntry>>,
     artwork_url: Option<String>,
-    artwork: Option<DynamicImage>,
+    artwork: Option<ArtworkProtocols>,
     stream: Option<String>,
+}
+
+/// Terminal-ready artwork. The Lanczos3 resize and protocol encoding are the
+/// expensive part of an artwork update, so they are built on the worker thread
+/// and the finished protocols handed to the UI thread for a cheap assignment.
+struct ArtworkProtocols {
+    primary: Option<ratatui_image::protocol::Protocol>,
+    primary_size: Size,
+    compact: Option<ratatui_image::protocol::Protocol>,
 }
 
 struct ScheduleUpdate {
@@ -206,7 +216,7 @@ fn main() -> Result<()> {
         // screen is active and before event handling begins.
         let picker = Picker::from_query_stdio().context("detect terminal image support")?;
         let (media_tx, media_rx) = mpsc::channel();
-        let mut app = App::load(&picker, media_tx)?;
+        let mut app = App::load(&picker, media_tx);
         drain_startup_responses()?;
         app.start_default_playback();
         app.sync_now_playing();
@@ -220,7 +230,10 @@ fn main() -> Result<()> {
 }
 
 impl App {
-    fn load(picker: &Picker, media_sender: mpsc::Sender<MediaCommand>) -> Result<Self> {
+    fn load(picker: &Picker, media_sender: mpsc::Sender<MediaCommand>) -> Self {
+        // Return immediately with fallback copy so the first frame paints and
+        // accepts input without waiting on the network. Live show titles and
+        // artwork stream in from a background thread (see `run`).
         let mut app = Self {
             channels: fallback_channels(),
             selected: 0,
@@ -235,12 +248,8 @@ impl App {
             view: View::Listen,
             error: None,
         };
-        match fetch_live_updates(app.artwork_urls()) {
-            Ok(updates) => app.apply_channel_updates(updates),
-            Err(error) => app.error = Some(format!("Live data unavailable: {error}")),
-        }
         app.animate_selection();
-        Ok(app)
+        app
     }
 
     fn artwork_urls(&self) -> Vec<Option<String>> {
@@ -270,12 +279,6 @@ impl App {
     }
 
     fn apply_channel_updates(&mut self, updates: Vec<ChannelUpdate>) {
-        let picker = self.picker.clone();
-        // The wide card is deliberately artwork-led: at 50 cells this fills
-        // its usable height while retaining NTS's landscape crop.
-        let primary_size = nts_artwork_size(picker.font_size(), 50);
-        let compact_size = nts_artwork_size(picker.font_size(), 16);
-
         for update in updates {
             let channel = &mut self.channels[update.index];
             channel.show = update.show;
@@ -290,18 +293,10 @@ impl App {
             if let Some(stream) = update.stream {
                 channel.stream = stream;
             }
-
-            if let Some(image) = update.artwork
-                && picker.protocol_type() != ProtocolType::Halfblocks
-            {
-                let primary = artwork_to_cells(&image, picker.font_size(), primary_size);
-                let compact = artwork_to_cells(&image, picker.font_size(), compact_size);
-                channel.artwork_primary = picker
-                    .new_protocol(primary, primary_size, Resize::Fit(None))
-                    .ok();
-                channel.artwork_compact = picker
-                    .new_protocol(compact, compact_size, Resize::Fit(None))
-                    .ok();
+            if let Some(artwork) = update.artwork {
+                channel.artwork_primary = artwork.primary;
+                channel.artwork_primary_size = Some(artwork.primary_size);
+                channel.artwork_compact = artwork.compact;
             }
         }
     }
@@ -583,6 +578,10 @@ impl Player {
                 "--cache-secs=0.2",
                 "--demuxer-readahead-secs=0.2",
                 "--cache-pause-wait=0.1",
+                // NTS's direct streams identify their audio format quickly.
+                // Avoid mpv's conservative default probe window on retune.
+                "--demuxer-lavf-probesize=32768",
+                "--demuxer-lavf-analyzeduration=0",
                 &ipc_arg,
                 stream,
             ])
@@ -590,7 +589,12 @@ impl Player {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .context("start mpv")?;
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => {
+                    anyhow::anyhow!("Install mpv first: brew install mpv")
+                }
+                _ => anyhow::Error::new(error).context("start mpv"),
+            })?;
 
         Ok(Self { child, ipc_path })
     }
@@ -676,6 +680,7 @@ fn fallback_channels() -> Vec<Channel> {
             schedule: Vec::new(),
             artwork_url: None,
             artwork_primary: None,
+            artwork_primary_size: None,
             artwork_compact: None,
         },
         Channel {
@@ -691,6 +696,7 @@ fn fallback_channels() -> Vec<Channel> {
             schedule: Vec::new(),
             artwork_url: None,
             artwork_primary: None,
+            artwork_primary_size: None,
             artwork_compact: None,
         },
         mixtape_channel(
@@ -750,11 +756,15 @@ fn mixtape_channel(name: &'static str, label: &'static str, stream: &'static str
         schedule: Vec::new(),
         artwork_url: None,
         artwork_primary: None,
+        artwork_primary_size: None,
         artwork_compact: None,
     }
 }
 
-fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
+fn fetch_live_updates(
+    picker: &Picker,
+    known_artwork_urls: Vec<Option<String>>,
+) -> Result<Vec<ChannelUpdate>> {
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let live: LiveResponse = client.get(LIVE_API).send()?.error_for_status()?.json()?;
     let mut updates = Vec::with_capacity(2);
@@ -783,6 +793,7 @@ fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<Cha
             artwork_url
                 .as_deref()
                 .and_then(|url| fetch_image(&client, url).ok())
+                .and_then(|image| build_artwork(picker, &image))
         } else {
             None
         };
@@ -834,7 +845,10 @@ fn fetch_schedule_updates() -> Result<Vec<ScheduleUpdate>> {
     Ok(updates)
 }
 
-fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
+fn fetch_mixtape_updates(
+    picker: &Picker,
+    known_artwork_urls: Vec<Option<String>>,
+) -> Result<Vec<ChannelUpdate>> {
     const MIXTAPES: [&str; 8] = [
         "poolside",
         "slow-focus",
@@ -860,6 +874,7 @@ fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<
             artwork_url
                 .as_deref()
                 .and_then(|url| fetch_image(&client, url).ok())
+                .and_then(|image| build_artwork(picker, &image))
         } else {
             None
         };
@@ -938,6 +953,29 @@ fn fetch_image(client: &Client, url: &str) -> Result<DynamicImage> {
     image::load_from_memory(&bytes).context("decode NTS artwork")
 }
 
+fn build_artwork(picker: &Picker, image: &DynamicImage) -> Option<ArtworkProtocols> {
+    // Halfblocks render straight from the cell buffer, so there is no protocol
+    // to precompute. Skip the work and let the UI fall back to text.
+    if picker.protocol_type() == ProtocolType::Halfblocks {
+        return None;
+    }
+    // The wide card is deliberately artwork-led: at 56 cells this fills its
+    // usable height while retaining NTS's landscape crop.
+    let primary_size = nts_artwork_size(picker.font_size(), 56);
+    let compact_size = nts_artwork_size(picker.font_size(), 16);
+    let primary = artwork_to_cells(image, picker.font_size(), primary_size);
+    let compact = artwork_to_cells(image, picker.font_size(), compact_size);
+    Some(ArtworkProtocols {
+        primary: picker
+            .new_protocol(primary, primary_size, Resize::Fit(None))
+            .ok(),
+        primary_size,
+        compact: picker
+            .new_protocol(compact, compact_size, Resize::Fit(None))
+            .ok(),
+    })
+}
+
 fn artwork_to_cells(image: &DynamicImage, font_size: FontSize, cells: Size) -> DynamicImage {
     let width = u32::from(cells.width) * u32::from(font_size.width);
     let height = u32::from(cells.height) * u32::from(font_size.height);
@@ -953,16 +991,10 @@ fn nts_artwork_size(font_size: FontSize, width_cells: u16) -> Size {
 }
 
 fn launch_player(stream: &str) -> Result<Player> {
-    if Command::new("mpv")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-    {
-        return Player::start(stream);
-    }
-    anyhow::bail!("Install mpv first: brew install mpv")
+    // Spawn directly; a missing binary surfaces as the install hint from
+    // `Player::start`. Probing with `mpv --version` first would block the
+    // caller on a synchronous subprocess for no added safety.
+    Player::start(stream)
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -986,6 +1018,19 @@ fn drain_startup_responses() -> Result<()> {
     Ok(())
 }
 
+fn request_live_refresh(
+    sender: &mpsc::Sender<BackgroundUpdate>,
+    picker: Picker,
+    artwork_urls: Vec<Option<String>>,
+) {
+    let sender = sender.clone();
+    thread::spawn(move || {
+        let _ = sender.send(BackgroundUpdate::Live(
+            fetch_live_updates(&picker, artwork_urls).map_err(|error| error.to_string()),
+        ));
+    });
+}
+
 fn request_schedule_refresh(sender: &mpsc::Sender<BackgroundUpdate>) {
     let sender = sender.clone();
     thread::spawn(move || {
@@ -997,12 +1042,13 @@ fn request_schedule_refresh(sender: &mpsc::Sender<BackgroundUpdate>) {
 
 fn request_mixtape_refresh(
     sender: &mpsc::Sender<BackgroundUpdate>,
+    picker: Picker,
     artwork_urls: Vec<Option<String>>,
 ) {
     let sender = sender.clone();
     thread::spawn(move || {
         let _ = sender.send(BackgroundUpdate::Mixtapes(
-            fetch_mixtape_updates(artwork_urls).map_err(|error| error.to_string()),
+            fetch_mixtape_updates(&picker, artwork_urls).map_err(|error| error.to_string()),
         ));
     });
 }
@@ -1018,13 +1064,17 @@ fn run(
     let mut title_dirty = true;
     let mut next_title_tick = Instant::now();
     let (update_tx, update_rx) = mpsc::channel::<BackgroundUpdate>();
-    let mut refresh_in_flight = false;
     let mut schedule_in_flight = false;
+    // Fetch live data on a background thread right away. `App::load` returns
+    // with fallback copy so this first frame is already drawn and interactive;
+    // the real show titles and artwork arrive via `BackgroundUpdate::Live`.
+    let mut refresh_in_flight = true;
+    request_live_refresh(&update_tx, app.picker.clone(), app.artwork_urls());
     let mut next_refresh = Instant::now() + app.next_refresh_delay();
     let mut next_schedule_refresh = Instant::now();
     let mut next_player_probe = Instant::now() + Duration::from_millis(300);
 
-    request_mixtape_refresh(&update_tx, app.artwork_urls());
+    request_mixtape_refresh(&update_tx, app.picker.clone(), app.artwork_urls());
     loop {
         let now = Instant::now();
         while let Ok(command) = media_rx.try_recv() {
@@ -1077,13 +1127,7 @@ fn run(
         if !refresh_in_flight && now >= next_refresh {
             next_refresh = now + Duration::from_secs(60);
             refresh_in_flight = true;
-            let tx = update_tx.clone();
-            let known_artwork_urls = app.artwork_urls();
-            thread::spawn(move || {
-                let _ = tx.send(BackgroundUpdate::Live(
-                    fetch_live_updates(known_artwork_urls).map_err(|error| error.to_string()),
-                ));
-            });
+            request_live_refresh(&update_tx, app.picker.clone(), app.artwork_urls());
         }
         if !schedule_in_flight && now >= next_schedule_refresh {
             next_schedule_refresh = now + Duration::from_secs(15 * 60);
@@ -1141,6 +1185,7 @@ fn run(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            let had_overlay = app.visualizer.is_some() || app.view != View::Listen;
             dirty = match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
                 KeyCode::Esc => {
@@ -1203,6 +1248,12 @@ fn run(
                 }
                 _ => false,
             };
+            if dirty && had_overlay && app.visualizer.is_none() && app.view == View::Listen {
+                // A modal clears cells that may be occupied by a terminal
+                // graphics-protocol image. Reset Ratatui's previous buffer so
+                // the uncovered artwork is sent again on the next draw.
+                terminal.clear()?;
+            }
             title_dirty = title_dirty || dirty;
             if dirty {
                 app.sync_now_playing();
@@ -1697,11 +1748,11 @@ fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let switcher = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(0),
         ])
         .split(columns[2]);
@@ -1722,7 +1773,7 @@ fn draw_wide_channels(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn wide_content_area(area: Rect) -> Rect {
     Rect {
-        height: area.height.min(18),
+        height: area.height.min(20),
         ..area
     }
 }
@@ -1804,7 +1855,7 @@ fn render_now_playing_card(frame: &mut Frame<'_>, channel: &Channel, area: Rect,
     frame.render_widget(block, area);
 
     if let Some(artwork) = &channel.artwork_primary {
-        let artwork_width = inner.width.saturating_sub(24).clamp(30, 50);
+        let artwork_width = inner.width.saturating_sub(24).clamp(30, 56);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1813,8 +1864,23 @@ fn render_now_playing_card(frame: &mut Frame<'_>, channel: &Channel, area: Rect,
                 Constraint::Min(20),
             ])
             .split(inner);
-        frame.render_widget(Image::new(artwork), columns[0]);
-        render_now_text(frame, channel, columns[2], true);
+        let artwork_size = channel
+            .artwork_primary_size
+            .unwrap_or_else(|| Size::new(columns[0].width, columns[0].height));
+        let artwork_height = artwork_size.height.min(columns[0].height);
+        let artwork_area = Rect {
+            y: columns[0].y + columns[0].height.saturating_sub(artwork_height) / 2,
+            height: artwork_height,
+            ..columns[0]
+        };
+        frame.render_widget(Image::new(artwork), artwork_area);
+        let text_height = now_text_height(channel, columns[2].width, true).min(columns[2].height);
+        let text_area = Rect {
+            y: artwork_area.y + artwork_area.height.saturating_sub(text_height) / 2,
+            height: text_height,
+            ..columns[2]
+        };
+        render_now_text(frame, channel, text_area, true);
     } else {
         render_now_text(frame, channel, inner, true);
     }
@@ -1830,23 +1896,11 @@ fn render_channel_switcher(
 ) {
     let block = Block::default()
         .borders(Borders::LEFT)
-        .border_style(Style::default().fg(if selected { INK } else { BORDER }))
-        .style(Style::default().bg(Color::Reset))
+        .border_style(Style::default().fg(if selected { SIGNAL } else { BORDER }))
+        .style(Style::default().bg(if selected { SURFACE } else { Color::Reset }))
         .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Length(1),
-            Constraint::Min(20),
-        ])
-        .split(inner);
-    if let Some(artwork) = &channel.artwork_compact {
-        frame.render_widget(Image::new(artwork), columns[0]);
-    }
 
     let label = if selected { "→" } else { " " };
     let activity = if selected && playing && buffering {
@@ -1874,7 +1928,7 @@ fn render_channel_switcher(
             Style::default().fg(INK).add_modifier(Modifier::BOLD),
         ),
     ];
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), columns[2]);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
 }
 
 fn render_now_text(frame: &mut Frame<'_>, channel: &Channel, area: Rect, show_next: bool) {
@@ -1903,6 +1957,32 @@ fn render_now_text(frame: &mut Frame<'_>, channel: &Channel, area: Rect, show_ne
         ]);
     }
     frame.render_widget(Paragraph::new(copy).wrap(Wrap { trim: true }), area);
+}
+
+fn now_text_height(channel: &Channel, width: u16, show_next: bool) -> u16 {
+    let description_lines = wrapped_line_count(&channel.description, width);
+    let next_lines = if show_next && channel.kind == ChannelKind::Live {
+        2 // Spacer plus the schedule line.
+    } else {
+        0
+    };
+    2 + description_lines + next_lines
+}
+
+fn wrapped_line_count(value: &str, width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let mut lines = 1u16;
+    let mut line_width = 0usize;
+    for word in value.split_whitespace() {
+        let word_width = word.chars().count();
+        if line_width > 0 && line_width + 1 + word_width > width {
+            lines += 1;
+            line_width = word_width;
+        } else {
+            line_width += usize::from(line_width > 0) + word_width;
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
