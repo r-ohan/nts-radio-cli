@@ -26,8 +26,15 @@ brew trust r-ohan/nts
 brew install nts
 ```
 
-`mpv` is installed automatically by Homebrew. To build from source, install
-Rust 1.85+ and `mpv`, then run:
+`mpv` is installed automatically by Homebrew.
+
+With Cargo, install from crates.io (requires Rust 1.85+ and `mpv`):
+
+```sh
+cargo install nts-radio-cli
+```
+
+Or build the latest from source:
 
 ```sh
 cargo install --git https://github.com/r-ohan/nts-radio-cli.git

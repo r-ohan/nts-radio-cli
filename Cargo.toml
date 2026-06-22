@@ -1,6 +1,6 @@
 [package]
 name = "nts-radio-cli"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A rich terminal home for NTS Radio"
 license = "MIT"
