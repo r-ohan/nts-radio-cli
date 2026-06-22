@@ -253,6 +253,12 @@ impl App {
         app
     }
 
+    /// Whether the terminal has a graphics protocol. On text-only terminals we
+    /// omit artwork (see README) rather than render a half-block raster.
+    fn supports_artwork(&self) -> bool {
+        self.picker.protocol_type() != ProtocolType::Halfblocks
+    }
+
     fn artwork_urls(&self) -> Vec<Option<String>> {
         self.channels
             .iter()
@@ -282,9 +288,7 @@ impl App {
     fn apply_channel_updates(&mut self, updates: Vec<ChannelUpdate>) {
         let picker = self.picker.clone();
         let encoded_tx = self.encoded_tx.clone();
-        // On a text-only terminal we deliberately omit artwork rather than fall
-        // back to a half-block raster (see README). Skip building the protocol.
-        let supports_artwork = picker.protocol_type() != ProtocolType::Halfblocks;
+        let supports_artwork = self.supports_artwork();
         for update in updates {
             let index = update.index;
             let channel = &mut self.channels[index];
@@ -1331,6 +1335,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
         let card = draw_compact(frame, app, main[1]);
         render_footer(frame, app, main[2], true);
         render_error(frame, app, main[2]);
+        render_terminal_hint(frame, app, main[2]);
         match app.view {
             View::Schedule => draw_schedule_modal(frame, app, true),
             View::Explore => draw_explore_modal(frame, app, true),
@@ -1371,6 +1376,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> Rect {
     let card = draw_wide_channels(frame, app, main[2]);
     render_footer(frame, app, main[3], false);
     render_error(frame, app, main[3]);
+    render_terminal_hint(frame, app, main[3]);
     match app.view {
         View::Schedule => draw_schedule_modal(frame, app, false),
         View::Explore => draw_explore_modal(frame, app, false),
@@ -1410,6 +1416,29 @@ fn render_error(frame: &mut Frame<'_>, app: &App, footer_area: Rect) {
             error_area,
         );
     }
+}
+
+/// Nudge text-only terminals toward an image-capable one. Shares the row above
+/// the footer with the error line, which takes priority when present.
+fn render_terminal_hint(frame: &mut Frame<'_>, app: &App, footer_area: Rect) {
+    if app.supports_artwork() || app.error.is_some() {
+        return;
+    }
+    let hint_area = Rect {
+        y: footer_area.y.saturating_sub(1),
+        height: 1,
+        ..footer_area
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("◌ ", Style::default().fg(SIGNAL)),
+            Span::styled(
+                "Artwork hidden — open NTS in Ghostty, iTerm2, or Kitty to see cover art.",
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        hint_area,
+    );
 }
 
 fn status_copy(app: &App) -> String {
