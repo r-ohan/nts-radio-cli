@@ -202,6 +202,13 @@ enum BackgroundUpdate {
     Live(std::result::Result<Vec<ChannelUpdate>, String>),
     Schedules(std::result::Result<Vec<ScheduleUpdate>, String>),
     Mixtapes(std::result::Result<Vec<ChannelUpdate>, String>),
+    // A single channel's artwork, fetched on its own thread so a slow or failing
+    // image never holds back the text or another channel's cover.
+    Artwork {
+        index: usize,
+        url: String,
+        image: DynamicImage,
+    },
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -436,6 +443,32 @@ impl App {
                         )));
                     }
                 }
+            }
+        }
+    }
+
+    /// Install a freshly decoded cover for one channel. Mirrors the artwork arm
+    /// of [`apply_channel_updates`], but arrives independently of the metadata so
+    /// the title and description never wait on the image.
+    fn apply_artwork(&mut self, index: usize, url: String, image: DynamicImage) {
+        if !self.supports_artwork() {
+            return;
+        }
+        let Some(encoded_tx) = self.encoded_tx.clone() else {
+            return;
+        };
+        let picker = self.picker.clone();
+        let Some(channel) = self.channels.get_mut(index) else {
+            return;
+        };
+        channel.artwork_url = Some(url);
+        let protocol = picker.new_resize_protocol(image);
+        match &channel.artwork {
+            Some(artwork) => artwork.borrow_mut().replace_protocol(protocol),
+            None => {
+                channel.artwork = Some(RefCell::new(spawn_artwork_worker(
+                    index, protocol, &encoded_tx,
+                )));
             }
         }
     }
@@ -930,8 +963,16 @@ fn mixtape_channel(name: &'static str, label: &'static str, stream: &'static str
     }
 }
 
-fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+/// A live channel's metadata plus the URLs of its candidate cover art. Artwork
+/// is fetched separately (see `request_live_refresh`) so a slow download never
+/// delays the title, description, and schedule that ride along in `update`.
+struct LiveUpdate {
+    update: ChannelUpdate,
+    medium: Option<String>,
+    thumb: Option<String>,
+}
+
+fn fetch_live_updates(client: &Client) -> Result<Vec<LiveUpdate>> {
     let live: LiveResponse = client.get(LIVE_API).send()?.error_for_status()?.json()?;
     let mut updates = Vec::with_capacity(2);
 
@@ -950,32 +991,33 @@ fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<Cha
             name: now_name,
             description: now_description,
             media: now_media,
-        } = resolve_details(&client, &now);
+        } = resolve_details(client, &now);
         let Details {
             name: next_name, ..
         } = next.embeds.details.unwrap_or_default();
-        let (artwork_url, artwork) = fetch_artwork(
-            &client,
-            now_media.picture_medium.as_deref(),
-            now_media.picture_thumb.as_deref(),
-            known_artwork_urls[index].as_deref(),
-        );
 
-        updates.push(ChannelUpdate {
-            index,
-            show: now_name
-                .or(now.broadcast_title)
-                .unwrap_or_else(|| "Live transmission".to_owned()),
-            description: now_description.unwrap_or_default(),
-            next_show: next_name
-                .or(next.broadcast_title)
-                .unwrap_or_else(|| "Coming up soon".to_owned()),
-            next_starts_at: broadcast_time(next.start_timestamp.as_deref()),
-            ends_at,
-            schedule: Some(schedule),
-            artwork_url,
-            artwork,
-            stream: None,
+        updates.push(LiveUpdate {
+            update: ChannelUpdate {
+                index,
+                show: now_name
+                    .or(now.broadcast_title)
+                    .unwrap_or_else(|| "Live transmission".to_owned()),
+                description: now_description.unwrap_or_default(),
+                next_show: next_name
+                    .or(next.broadcast_title)
+                    .unwrap_or_else(|| "Coming up soon".to_owned()),
+                next_starts_at: broadcast_time(next.start_timestamp.as_deref()),
+                ends_at,
+                schedule: Some(schedule),
+                // Carry the candidate URL (not a decoded image): apply leaves
+                // existing artwork untouched while the real cover streams in via
+                // BackgroundUpdate::Artwork, and clears it only when truly absent.
+                artwork_url: now_media.picture_medium.clone().or(now_media.picture_thumb.clone()),
+                artwork: None,
+                stream: None,
+            },
+            medium: now_media.picture_medium,
+            thumb: now_media.picture_thumb,
         });
     }
 
@@ -1119,7 +1161,10 @@ fn broadcast_time(timestamp: Option<&str>) -> String {
 fn fetch_image(client: &Client, url: &str) -> Result<DynamicImage> {
     let bytes = client
         .get(url)
-        .timeout(Duration::from_secs(4))
+        // Generous because the largest covers (NTS 1's square art can top
+        // 400KB) were timing out at 4s on slower links; artwork now fetches off
+        // the metadata path, so a longer wait costs nothing the user sees.
+        .timeout(Duration::from_secs(10))
         .send()?
         .error_for_status()?
         .bytes()?;
@@ -1248,9 +1293,45 @@ fn request_live_refresh(
 ) {
     let sender = sender.clone();
     thread::spawn(move || {
-        let _ = sender.send(BackgroundUpdate::Live(
-            fetch_live_updates(artwork_urls).map_err(|error| error.to_string()),
-        ));
+        let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = sender.send(BackgroundUpdate::Live(Err(error.to_string())));
+                return;
+            }
+        };
+        let live = match fetch_live_updates(&client) {
+            Ok(live) => live,
+            Err(error) => {
+                let _ = sender.send(BackgroundUpdate::Live(Err(error.to_string())));
+                return;
+            }
+        };
+        // Send the text the moment it is parsed so the UI fills in immediately,
+        // then chase each channel's cover on its own thread. Splitting the work
+        // keeps one slow or oversized image from stalling the others or the text.
+        let jobs: Vec<(usize, Option<String>, Option<String>)> = live
+            .iter()
+            .map(|live| (live.update.index, live.medium.clone(), live.thumb.clone()))
+            .collect();
+        let metadata = live.into_iter().map(|live| live.update).collect();
+        let _ = sender.send(BackgroundUpdate::Live(Ok(metadata)));
+
+        for (index, medium, thumb) in jobs {
+            let known = artwork_urls.get(index).cloned().flatten();
+            let sender = sender.clone();
+            let client = client.clone();
+            thread::spawn(move || {
+                let (url, image) =
+                    fetch_artwork(&client, medium.as_deref(), thumb.as_deref(), known.as_deref());
+                // fetch_artwork yields an image only for a fresh, successful
+                // download; an unchanged or failed cover sends nothing and is
+                // retried on the next live refresh.
+                if let (Some(url), Some(image)) = (url, image) {
+                    let _ = sender.send(BackgroundUpdate::Artwork { index, url, image });
+                }
+            });
+        }
     });
 }
 
@@ -1379,6 +1460,10 @@ fn run(
                         }
                         Err(_) => next_mixtape_refresh = Instant::now() + NETWORK_RETRY_DELAY,
                     }
+                }
+                BackgroundUpdate::Artwork { index, url, image } => {
+                    app.apply_artwork(index, url, image);
+                    dirty = true;
                 }
             }
         }
