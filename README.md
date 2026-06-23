@@ -14,7 +14,7 @@
 brew install r-ohan/nts/nts
 ```
 
-With Cargo, install from crates.io:
+or, with Cargo, install from crates.io:
 
 ```sh
 cargo install nts-radio-cli
