@@ -46,6 +46,10 @@ use visualizer::LiveVisualizer;
 const LIVE_API: &str = "https://www.nts.live/api/v2/live";
 const SCHEDULE_API: &str = "https://www.nts.live/api/v2/radio/schedule";
 const MIXTAPE_API: &str = "https://www.nts.live/api/v2/mixtapes";
+// How long to wait before retrying after a failed background fetch, and the
+// steady cadence for refreshing (rarely-changing) mixtape metadata.
+const NETWORK_RETRY_DELAY: Duration = Duration::from_secs(15);
+const MIXTAPE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const NTS_1_STREAM: &str = "https://stream-relay-geo.ntslive.net/stream?client=direct";
 const NTS_2_STREAM: &str = "https://stream-relay-geo.ntslive.net/stream2?client=direct";
 
@@ -116,6 +120,9 @@ struct App {
     visualizer: Option<LiveVisualizer>,
     view: View,
     error: Option<String>,
+    // Set when a live refresh fails so the footer can show a "retrying" notice
+    // instead of leaving the user staring at stale fallback copy (see `run`).
+    connection_lost: bool,
     // Workers send (channel index, encoded protocol) back here. Set in `run`;
     // `None` outside the event loop (e.g. tests), where artwork is never built.
     encoded_tx: Option<mpsc::Sender<(usize, ResizeResponse)>>,
@@ -310,6 +317,7 @@ impl App {
             visualizer: None,
             view: View::Listen,
             error: None,
+            connection_lost: false,
             encoded_tx: None,
         }
     }
@@ -947,11 +955,16 @@ fn fetch_schedule_updates() -> Result<Vec<ScheduleUpdate>> {
     let mut updates = Vec::with_capacity(2);
 
     for index in 0..2 {
-        let schedule: ScheduleResponse = client
+        // Fetch each channel's schedule independently so one failure does not
+        // discard the other; missing ones are retried on the next refresh.
+        let response = client
             .get(format!("{SCHEDULE_API}/{}?past_days=0", index + 1))
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.json::<ScheduleResponse>());
+        let Ok(schedule) = response else {
+            continue;
+        };
         let broadcasts = schedule
             .results
             .into_iter()
@@ -982,11 +995,17 @@ fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let mut updates = Vec::with_capacity(MIXTAPES.len());
     for (offset, alias) in MIXTAPES.iter().enumerate() {
-        let mixtape: MixtapeResponse = client
+        // Fetch each mixtape independently: a single slow or 404ing alias should
+        // not discard the others. Failures are skipped and retried on the next
+        // mixtape refresh (see `run`).
+        let response = client
             .get(format!("{MIXTAPE_API}/{alias}"))
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.json::<MixtapeResponse>());
+        let Ok(mixtape) = response else {
+            continue;
+        };
         let index = offset + 2;
         let (artwork_url, artwork) = fetch_artwork(
             &client,
@@ -1200,6 +1219,11 @@ fn run(
     let mut next_schedule_refresh = Instant::now();
     let mut next_player_probe = Instant::now() + Duration::from_millis(300);
 
+    // Mixtape metadata rarely changes, so it refreshes on a slow cadence; but it
+    // must still retry, because a failed startup fetch otherwise leaves the
+    // Explore view on "loading" copy for the life of the process.
+    let mut mixtape_in_flight = true;
+    let mut next_mixtape_refresh = Instant::now() + MIXTAPE_REFRESH_INTERVAL;
     request_mixtape_refresh(&update_tx, app.artwork_urls());
     loop {
         app.pump_now_playing();
@@ -1234,26 +1258,46 @@ fn run(
             match update {
                 BackgroundUpdate::Live(result) => {
                     refresh_in_flight = false;
-                    if let Ok(updates) = result {
-                        app.apply_channel_updates(updates);
-                        app.sync_now_playing();
-                        dirty = true;
-                        title_dirty = true;
-                        next_refresh = Instant::now() + app.next_refresh_delay();
+                    match result {
+                        Ok(updates) => {
+                            app.apply_channel_updates(updates);
+                            app.sync_now_playing();
+                            if app.connection_lost {
+                                app.connection_lost = false;
+                            }
+                            dirty = true;
+                            title_dirty = true;
+                            next_refresh = Instant::now() + app.next_refresh_delay();
+                        }
+                        // Surface the failure and retry soon rather than sitting
+                        // on stale fallback copy until the next 60s tick.
+                        Err(_) => {
+                            app.connection_lost = true;
+                            dirty = true;
+                            next_refresh = Instant::now() + NETWORK_RETRY_DELAY;
+                        }
                     }
                 }
                 BackgroundUpdate::Schedules(result) => {
                     schedule_in_flight = false;
-                    if let Ok(updates) = result {
-                        app.apply_schedule_updates(updates);
-                        dirty = true;
+                    match result {
+                        Ok(updates) => {
+                            app.apply_schedule_updates(updates);
+                            dirty = true;
+                        }
+                        Err(_) => next_schedule_refresh = Instant::now() + NETWORK_RETRY_DELAY,
                     }
                 }
                 BackgroundUpdate::Mixtapes(result) => {
-                    if let Ok(updates) = result {
-                        app.apply_channel_updates(updates);
-                        app.sync_now_playing();
-                        dirty = true;
+                    mixtape_in_flight = false;
+                    match result {
+                        Ok(updates) => {
+                            app.apply_channel_updates(updates);
+                            app.sync_now_playing();
+                            dirty = true;
+                            next_mixtape_refresh = Instant::now() + MIXTAPE_REFRESH_INTERVAL;
+                        }
+                        Err(_) => next_mixtape_refresh = Instant::now() + NETWORK_RETRY_DELAY,
                     }
                 }
             }
@@ -1267,6 +1311,11 @@ fn run(
             next_schedule_refresh = now + Duration::from_secs(15 * 60);
             schedule_in_flight = true;
             request_schedule_refresh(&update_tx);
+        }
+        if !mixtape_in_flight && now >= next_mixtape_refresh {
+            next_mixtape_refresh = now + MIXTAPE_REFRESH_INTERVAL;
+            mixtape_in_flight = true;
+            request_mixtape_refresh(&update_tx, app.artwork_urls());
         }
         if app.playing && now >= next_player_probe {
             app.poll_player();
@@ -1293,6 +1342,10 @@ fn run(
         if !schedule_in_flight {
             poll_interval =
                 poll_interval.min(next_schedule_refresh.saturating_duration_since(Instant::now()));
+        }
+        if !mixtape_in_flight {
+            poll_interval =
+                poll_interval.min(next_mixtape_refresh.saturating_duration_since(Instant::now()));
         }
         if app.playing {
             poll_interval =
@@ -1487,14 +1540,21 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, compact: bool) {
 }
 
 fn render_error(frame: &mut Frame<'_>, app: &App, footer_area: Rect) {
-    if let Some(error) = &app.error {
+    // An explicit notice (playback errors, user hints) takes priority; otherwise
+    // fall back to the connectivity notice so a failed fetch never looks like a
+    // silent hang.
+    let notice = app
+        .error
+        .as_deref()
+        .or_else(|| app.connection_lost.then_some("◌ Couldn't reach NTS — retrying…"));
+    if let Some(notice) = notice {
         let error_area = Rect {
             y: footer_area.y.saturating_sub(1),
             height: 1,
             ..footer_area
         };
         frame.render_widget(
-            Paragraph::new(error.as_str()).style(Style::default().fg(SIGNAL)),
+            Paragraph::new(notice).style(Style::default().fg(SIGNAL)),
             error_area,
         );
     }
@@ -1503,7 +1563,7 @@ fn render_error(frame: &mut Frame<'_>, app: &App, footer_area: Rect) {
 /// Nudge text-only terminals toward an image-capable one. Shares the row above
 /// the footer with the error line, which takes priority when present.
 fn render_terminal_hint(frame: &mut Frame<'_>, app: &App, footer_area: Rect) {
-    if app.supports_artwork() || app.error.is_some() {
+    if app.supports_artwork() || app.error.is_some() || app.connection_lost {
         return;
     }
     let hint_area = Rect {
@@ -2195,6 +2255,7 @@ mod tests {
             visualizer: None,
             view: View::Listen,
             error: None,
+            connection_lost: false,
             encoded_tx: None,
         }
     }
