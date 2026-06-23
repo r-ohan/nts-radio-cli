@@ -1448,14 +1448,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 
     let title = Line::from(vec![
         Span::styled("NTS", Style::default().fg(INK).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            "  —  LIVE, EVERYWHERE",
-            Style::default().fg(INK).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "    independent radio from london & beyond",
-            Style::default().fg(MUTED),
-        ),
+        Span::styled("  —  DON'T ASSUME", Style::default().fg(MUTED)),
     ]);
     frame.render_widget(Paragraph::new(title), main[0]);
     let status = status_copy(app);

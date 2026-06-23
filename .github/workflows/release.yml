@@ -18,9 +18,6 @@ jobs:
           - name: macos-aarch64
             runner: macos-14
             archive: nts-macos-aarch64.tar.gz
-          - name: macos-x86_64
-            runner: macos-13
-            archive: nts-macos-x86_64.tar.gz
           - name: linux-x86_64
             runner: ubuntu-latest
             archive: nts-linux-x86_64.tar.gz
@@ -28,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - run: tar -czf ${{ matrix.archive }} -C target/release nts
       - uses: actions/upload-artifact@v4
@@ -55,6 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Verify tag matches Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
