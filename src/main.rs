@@ -153,6 +153,30 @@ struct Broadcast {
     end_timestamp: Option<String>,
     #[serde(default)]
     embeds: Embeds,
+    // Each broadcast links to its episode resource, which carries the full
+    // details even when the inline embed does not. NTS labels that link `rel:
+    // "details"` on some payloads and `rel: "self"` on others, so we match on
+    // the stable signals instead (see `episode_url`).
+    #[serde(default)]
+    links: Vec<Link>,
+}
+
+impl Broadcast {
+    /// URL of the episode resource for this broadcast, identified by its episode
+    /// media type (`application/vnd.episode+json`) with the `/episodes/` path as
+    /// a fallback — never by `rel`, which NTS varies between "details" and
+    /// "self" across responses.
+    fn episode_url(&self) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|link| {
+                link.media_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.contains("episode"))
+                    || link.href.contains("/episodes/")
+            })
+            .map(|link| link.href.as_str())
+    }
 }
 
 struct ChannelUpdate {
@@ -197,6 +221,15 @@ struct Details {
 struct Media {
     picture_medium: Option<String>,
     picture_thumb: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct Link {
+    href: String,
+    // The MIME-ish type NTS attaches, e.g. "application/vnd.episode+json". This
+    // identifies the episode link reliably where `rel` does not.
+    #[serde(rename = "type", default)]
+    media_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -917,7 +950,7 @@ fn fetch_live_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<Cha
             name: now_name,
             description: now_description,
             media: now_media,
-        } = now.embeds.details.unwrap_or_default();
+        } = resolve_details(&client, &now);
         let Details {
             name: next_name, ..
         } = next.embeds.details.unwrap_or_default();
@@ -1091,6 +1124,53 @@ fn fetch_image(client: &Client, url: &str) -> Result<DynamicImage> {
         .error_for_status()?
         .bytes()?;
     image::load_from_memory(&bytes).context("decode NTS artwork")
+}
+
+/// Resolve a broadcast's full details — title, description, and artwork. The
+/// live API only inlines a details block for the `now`/`next` slots; a promoted
+/// (`next2`) or otherwise sparse broadcast arrives with none, so its title,
+/// description, and artwork all go missing together. Every broadcast links to
+/// its episode resource, which carries the complete details, so fall back to
+/// that when the inline block is incomplete. Only the fallback path makes a
+/// request.
+fn resolve_details(client: &Client, broadcast: &Broadcast) -> Details {
+    let inline = broadcast.embeds.details.clone().unwrap_or_default();
+    // Title, description, and either artwork size are independent fields; any of
+    // them can be absent on its own. Only skip the request when all are present.
+    let has_artwork =
+        inline.media.picture_medium.is_some() || inline.media.picture_thumb.is_some();
+    if inline.name.is_some() && inline.description.is_some() && has_artwork {
+        return inline;
+    }
+    let Some(url) = broadcast.episode_url() else {
+        return inline;
+    };
+    match fetch_episode_details(client, url) {
+        Ok(episode) => merge_details(inline, episode),
+        Err(_) => inline,
+    }
+}
+
+/// Fill in only the fields the inline block was missing, preferring inline data
+/// (which reflects the live slot) over the episode resource for every field.
+fn merge_details(mut inline: Details, episode: Details) -> Details {
+    inline.name = inline.name.or(episode.name);
+    inline.description = inline.description.or(episode.description);
+    inline.media.picture_medium = inline.media.picture_medium.or(episode.media.picture_medium);
+    inline.media.picture_thumb = inline.media.picture_thumb.or(episode.media.picture_thumb);
+    inline
+}
+
+/// The episode resource exposes `name`, `description`, and `media` at its top
+/// level, which deserialize straight into [`Details`].
+fn fetch_episode_details(client: &Client, url: &str) -> Result<Details> {
+    client
+        .get(url)
+        .timeout(Duration::from_secs(4))
+        .send()?
+        .error_for_status()?
+        .json()
+        .context("decode NTS episode details")
 }
 
 fn fetch_artwork(
@@ -2242,6 +2322,96 @@ fn now_text_height(channel: &Channel, width: u16, show_next: bool) -> u16 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn episode_url_is_resolved_by_media_type_not_rel() {
+        // The real sparse next2 shape: NTS links the episode by its episode
+        // media type. The rel varies between responses ("self" here, "details"
+        // elsewhere), so resolution must not depend on it.
+        let self_rel: Broadcast = serde_json::from_str(
+            r#"{"broadcast_title":"Show","links":[
+                {"rel":"self","href":"https://nts/api/v2/shows/x/episodes/y",
+                 "type":"application/vnd.episode+json;charset=utf-8"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(self_rel.episode_url(), Some("https://nts/api/v2/shows/x/episodes/y"));
+
+        let details_rel: Broadcast = serde_json::from_str(
+            r#"{"broadcast_title":"Show","links":[
+                {"rel":"details","href":"https://nts/api/v2/shows/x/episodes/y",
+                 "type":"application/vnd.episode+json"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(details_rel.episode_url(), Some("https://nts/api/v2/shows/x/episodes/y"));
+
+        // No type present: fall back to the /episodes/ path.
+        let path_only: Broadcast = serde_json::from_str(
+            r#"{"broadcast_title":"Show","links":[
+                {"rel":"self","href":"https://nts/api/v2/shows/x/episodes/y"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(path_only.episode_url(), Some("https://nts/api/v2/shows/x/episodes/y"));
+
+        // A non-episode self link (e.g. a channel) must not be mistaken for one.
+        let channel: Broadcast = serde_json::from_str(
+            r#"{"broadcast_title":"Show","links":[
+                {"rel":"self","href":"https://nts/api/v2/live","type":"application/vnd.channel+json"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(channel.episode_url(), None);
+    }
+
+    #[test]
+    fn resolve_details_uses_complete_inline_block_without_a_request() {
+        // All fields present inline: resolve_details returns them as-is and never
+        // touches the episode link, so this stays offline and deterministic.
+        let broadcast: Broadcast = serde_json::from_str(
+            r#"{
+                "broadcast_title": "Show",
+                "embeds": {"details": {
+                    "name": "Inline Name",
+                    "description": "Inline description",
+                    "media": {"picture_medium": "https://nts/art.png"}
+                }},
+                "links": [{"href":"https://nts/api/v2/shows/x/episodes/should-not-fetch",
+                           "type":"application/vnd.episode+json"}]
+            }"#,
+        )
+        .unwrap();
+        let details = resolve_details(&Client::new(), &broadcast);
+        assert_eq!(details.name.as_deref(), Some("Inline Name"));
+        assert_eq!(details.description.as_deref(), Some("Inline description"));
+        assert_eq!(details.media.picture_medium.as_deref(), Some("https://nts/art.png"));
+    }
+
+    #[test]
+    fn merge_details_fills_only_missing_inline_fields() {
+        let inline = Details {
+            name: Some("Inline".to_owned()),
+            description: None,
+            media: Media {
+                picture_medium: Some("inline.png".to_owned()),
+                picture_thumb: None,
+            },
+        };
+        let episode = Details {
+            name: Some("Episode".to_owned()),
+            description: Some("Episode desc".to_owned()),
+            media: Media {
+                picture_medium: Some("episode.png".to_owned()),
+                picture_thumb: Some("episode_thumb.png".to_owned()),
+            },
+        };
+        let merged = merge_details(inline, episode);
+        assert_eq!(merged.name.as_deref(), Some("Inline")); // kept
+        assert_eq!(merged.description.as_deref(), Some("Episode desc")); // filled
+        assert_eq!(merged.media.picture_medium.as_deref(), Some("inline.png")); // kept
+        assert_eq!(merged.media.picture_thumb.as_deref(), Some("episode_thumb.png")); // filled
+    }
+
     fn test_app(selected: usize) -> App {
         App {
             channels: fallback_channels(),
@@ -2448,6 +2618,7 @@ mod tests {
             start_timestamp: Some(starts_at.to_rfc3339()),
             end_timestamp: Some(ends_at.to_rfc3339()),
             embeds: Embeds::default(),
+            links: Vec::new(),
         }
     }
 }
