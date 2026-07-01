@@ -49,6 +49,7 @@ jobs:
   # (a crates.io API token with the publish-update scope).
   crates-io:
     name: Publish to crates.io
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +71,7 @@ jobs:
   # the secret is absent.
   homebrew:
     name: Bump Homebrew formula
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Update r-ohan/homebrew-nts formula

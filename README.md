@@ -8,6 +8,14 @@
 
 `nts` is an unofficial NTS Radio player for the terminal, written in Rust.
 
+## Requirements
+
+- **mpv** handles audio playback: `brew install mpv` on macOS, `apt install mpv`
+  (or your distribution's equivalent) on Linux. The Homebrew formula installs
+  it for you; `cargo install` does not.
+- macOS and Linux. Windows is not supported (playback control uses Unix
+  sockets).
+
 ## Install
 
 ```sh
@@ -19,6 +27,19 @@ or, with Cargo, install from crates.io:
 ```sh
 cargo install nts-radio-cli
 ```
+
+## Use
+
+```sh
+nts                          # open on NTS 1, playing
+nts 2                        # open on NTS 2
+nts poolside                 # open on an Infinite Mixtape by name
+nts slow-focus --no-autoplay # open without starting playback
+```
+
+Station names are forgiving: `slow-focus`, `Slow Focus`, and the NTS API alias
+(`100-percent-hip-hop` for Low Key) all work. Inside the app, keys `1`–`0`
+jump straight to any of the ten stations.
 
 ## Inside
 

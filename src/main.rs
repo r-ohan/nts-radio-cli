@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::SetTitle,
 };
@@ -42,6 +42,11 @@ mod now_playing;
 use now_playing::{MediaCommand, NowPlaying};
 mod visualizer;
 use visualizer::LiveVisualizer;
+
+// Fail Windows builds with one clear sentence instead of a confusing module
+// error from the unconditional `std::os::unix` imports above.
+#[cfg(not(unix))]
+compile_error!("nts supports macOS and Linux only (mpv IPC uses Unix sockets)");
 
 const LIVE_API: &str = "https://www.nts.live/api/v2/live";
 const SCHEDULE_API: &str = "https://www.nts.live/api/v2/radio/schedule";
@@ -120,6 +125,9 @@ struct App {
     visualizer: Option<LiveVisualizer>,
     view: View,
     error: Option<String>,
+    // Consecutive failed reconnect attempts; drives the exponential backoff in
+    // `poll_player` and resets to zero on any healthy probe or explicit stop.
+    reconnect_attempts: u32,
     // Set when a live refresh fails so the footer can show a "retrying" notice
     // instead of leaving the user staring at stale fallback copy (see `run`).
     connection_lost: bool,
@@ -264,23 +272,86 @@ struct MixtapeMedia {
     picture_thumb: Option<String>,
 }
 
-fn main() -> Result<()> {
-    if let Some(argument) = env::args().nth(1) {
+struct CliOptions {
+    station: usize,
+    autoplay: bool,
+}
+
+/// Parse the command line, exiting for `--help`/`--version` and with status 2
+/// (the usual usage-error code) for anything unrecognized.
+fn parse_cli() -> CliOptions {
+    let mut options = CliOptions {
+        station: 0,
+        autoplay: true,
+    };
+    for argument in env::args().skip(1) {
         match argument.as_str() {
             "--version" | "-V" => {
                 println!("nts {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
+                std::process::exit(0);
             }
             "--help" | "-h" => {
                 println!(
-                    "nts {}\n\nA terminal home for NTS Radio.\n\nUSAGE:\n    nts\n\nOPTIONS:\n    -h, --help       Print help\n    -V, --version    Print version",
+                    "nts {}\n\nA terminal home for NTS Radio.\n\nUSAGE:\n    nts [station] [--no-autoplay]\n\nSTATIONS:\n    1, 2, poolside, slow-focus, low-key, memory-lane, 4-to-the-floor,\n    island-time, the-tube, sheet-music\n\nOPTIONS:\n        --no-autoplay    Start without playing\n    -h, --help           Print help\n    -V, --version        Print version",
                     env!("CARGO_PKG_VERSION")
                 );
-                return Ok(());
+                std::process::exit(0);
             }
-            _ => anyhow::bail!("unknown option: {argument}\nTry `nts --help`"),
+            "--no-autoplay" => options.autoplay = false,
+            other if other.starts_with('-') => {
+                eprintln!("unknown option: {other}\nTry `nts --help`");
+                std::process::exit(2);
+            }
+            other => match station_index(other) {
+                Some(index) => options.station = index,
+                None => {
+                    eprintln!(
+                        "unknown station: {other}\nStations: 1, 2, poolside, slow-focus, low-key, memory-lane, 4-to-the-floor, island-time, the-tube, sheet-music"
+                    );
+                    std::process::exit(2);
+                }
+            },
         }
     }
+    options
+}
+
+/// Resolve a station argument to a channel index. Matching is forgiving:
+/// case-insensitive, and hyphens/spaces are interchangeable ("slow-focus",
+/// "Slow Focus", "slowfocus" all work). Mixtapes also answer to their NTS API
+/// alias (e.g. "100-percent-hip-hop" for Low Key).
+fn station_index(query: &str) -> Option<usize> {
+    let normalized = normalize_station(query);
+    if normalized.is_empty() {
+        return None;
+    }
+    match normalized.as_str() {
+        "1" => return Some(0),
+        "2" => return Some(1),
+        _ => {}
+    }
+    if let Some(index) = fallback_channels()
+        .iter()
+        .position(|channel| normalize_station(channel.name) == normalized)
+    {
+        return Some(index);
+    }
+    MIXTAPES
+        .iter()
+        .position(|alias| normalize_station(alias) == normalized)
+        .map(|offset| offset + 2)
+}
+
+fn normalize_station(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn main() -> Result<()> {
+    let cli = parse_cli();
     let mut terminal = ratatui::try_init().context("initialize terminal")?;
     spawn_signal_guard();
     let result = (|| {
@@ -289,8 +360,11 @@ fn main() -> Result<()> {
         let picker = Picker::from_query_stdio().context("detect terminal image support")?;
         let (media_tx, media_rx) = mpsc::channel();
         let mut app = App::load(&picker, media_tx);
+        app.selected = cli.station;
         drain_startup_responses()?;
-        app.start_default_playback();
+        if cli.autoplay {
+            app.start_default_playback();
+        }
         app.sync_now_playing();
 
         let result = run(&mut terminal, &mut app, media_rx);
@@ -301,6 +375,9 @@ fn main() -> Result<()> {
     // cursor separately because the terminal may have been left mid-frame.
     let cursor_result = terminal.show_cursor().context("restore terminal cursor");
     let restore_result = ratatui::try_restore().context("restore terminal");
+    // The playback title (see `set_terminal_title`) would otherwise outlive
+    // the process; an empty title hands naming back to the terminal.
+    let _ = execute!(io::stdout(), SetTitle(""));
     cursor_result?;
     restore_result?;
     result
@@ -357,6 +434,7 @@ impl App {
             visualizer: None,
             view: View::Listen,
             error: None,
+            reconnect_attempts: 0,
             connection_lost: false,
             encoded_tx: None,
         }
@@ -412,7 +490,12 @@ impl App {
             channel.next_show = update.next_show;
             channel.next_starts_at = update.next_starts_at;
             channel.ends_at = update.ends_at;
-            if let Some(schedule) = update.schedule {
+            // Channel updates may only seed an empty schedule. The dedicated
+            // schedule refresh (apply_schedule_updates) is the sole writer of a
+            // populated one; replacing it here would lose entries it fetched.
+            if let Some(schedule) = update.schedule
+                && channel.schedule.is_empty()
+            {
                 channel.schedule = schedule;
             }
             // Only remember a URL after its image actually decoded. Recording
@@ -467,7 +550,9 @@ impl App {
             Some(artwork) => artwork.borrow_mut().replace_protocol(protocol),
             None => {
                 channel.artwork = Some(RefCell::new(spawn_artwork_worker(
-                    index, protocol, &encoded_tx,
+                    index,
+                    protocol,
+                    &encoded_tx,
                 )));
             }
         }
@@ -500,7 +585,6 @@ impl App {
     }
 
     fn start_default_playback(&mut self) {
-        debug_assert_eq!(self.selected, 0);
         self.toggle_playback();
     }
 
@@ -555,6 +639,7 @@ impl App {
         }
         self.playing = false;
         self.buffering = false;
+        self.reconnect_attempts = 0;
     }
 
     fn toggle_visualizer(&mut self) {
@@ -717,36 +802,52 @@ impl App {
         true
     }
 
-    fn poll_player(&mut self) {
+    /// Probe playback health; returns how long the caller should wait before
+    /// probing again. Healthy playback re-probes at a steady one-second
+    /// cadence. A dead player enters a reconnect loop whose relaunch attempts
+    /// back off exponentially (see [`reconnect_delay`]) so a network outage is
+    /// a patient retry, not an mpv respawn storm.
+    fn poll_player(&mut self) -> Duration {
+        const PROBE_INTERVAL: Duration = Duration::from_secs(1);
         if !self.playing {
-            return;
+            return PROBE_INTERVAL;
         }
-        let result = self
-            .player
-            .as_mut()
-            .context("player process disappeared")
-            .and_then(Player::is_buffering);
-        match result {
+        let Some(player) = self.player.as_mut() else {
+            // A previous probe found the player dead; the backoff has elapsed
+            // (the caller waited out our returned delay), so relaunch now.
+            // "Reconnecting…" stays up until a healthy probe clears it —
+            // spawning mpv is not the same as audio coming back.
+            let stream = self.channels[self.selected].stream.clone();
+            return match launch_player(&stream) {
+                Ok(player) => {
+                    self.player = Some(player);
+                    self.buffering = true;
+                    PROBE_INTERVAL
+                }
+                Err(error) => {
+                    let delay = reconnect_delay(self.reconnect_attempts);
+                    self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+                    self.error = Some(format!("Reconnecting… ({error})"));
+                    delay
+                }
+            };
+        };
+        match player.is_buffering() {
             Ok(buffering) => {
                 self.buffering = buffering;
                 self.error = None;
+                self.reconnect_attempts = 0;
+                PROBE_INTERVAL
             }
-            Err(error) => {
-                let stream = self.channels[self.selected].stream.clone();
-                self.stop_player();
-                match launch_player(&stream) {
-                    Ok(player) => {
-                        self.player = Some(player);
-                        self.playing = true;
-                        self.buffering = true;
-                        self.error = Some("Stream reconnected.".to_owned());
-                    }
-                    Err(restart_error) => {
-                        self.error = Some(format!(
-                            "Playback stopped: {error}; reconnect failed: {restart_error}"
-                        ));
-                    }
+            Err(_) => {
+                if let Some(mut player) = self.player.take() {
+                    player.stop();
                 }
+                self.buffering = true;
+                self.error = Some("Reconnecting…".to_owned());
+                let delay = reconnect_delay(self.reconnect_attempts);
+                self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+                delay
             }
         }
     }
@@ -797,7 +898,11 @@ impl Player {
             .spawn()
             .map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => {
-                    anyhow::anyhow!("Install mpv first: brew install mpv")
+                    if cfg!(target_os = "macos") {
+                        anyhow::anyhow!("Install mpv first: brew install mpv")
+                    } else {
+                        anyhow::anyhow!("Install mpv first (e.g. apt install mpv)")
+                    }
                 }
                 _ => anyhow::Error::new(error).context("start mpv"),
             })?;
@@ -985,7 +1090,6 @@ fn fetch_live_updates(client: &Client) -> Result<Vec<LiveUpdate>> {
             continue;
         };
         let (now, next) = active_and_next(result.now, result.next, result.next2);
-        let schedule = schedule_from_broadcasts(&[now.clone(), next.clone()]);
         let ends_at = now.end_timestamp.clone();
         let Details {
             name: now_name,
@@ -1008,11 +1112,17 @@ fn fetch_live_updates(client: &Client) -> Result<Vec<LiveUpdate>> {
                     .unwrap_or_else(|| "Coming up soon".to_owned()),
                 next_starts_at: broadcast_time(next.start_timestamp.as_deref()),
                 ends_at,
-                schedule: Some(schedule),
+                // The dedicated schedule fetch owns `channel.schedule`; a
+                // two-entry now/next list from here would shrink the six-hour
+                // modal to two rows for most of each 15-minute window.
+                schedule: None,
                 // Carry the candidate URL (not a decoded image): apply leaves
                 // existing artwork untouched while the real cover streams in via
                 // BackgroundUpdate::Artwork, and clears it only when truly absent.
-                artwork_url: now_media.picture_medium.clone().or(now_media.picture_thumb.clone()),
+                artwork_url: now_media
+                    .picture_medium
+                    .clone()
+                    .or(now_media.picture_thumb.clone()),
                 artwork: None,
                 stream: None,
             },
@@ -1055,18 +1165,21 @@ fn fetch_schedule_updates() -> Result<Vec<ScheduleUpdate>> {
     Ok(updates)
 }
 
-fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
-    const MIXTAPES: [&str; 8] = [
-        "poolside",
-        "slow-focus",
-        "100-percent-hip-hop",
-        "memory-lane",
-        "4-to-the-floor",
-        "island-time",
-        "the-tube",
-        "sheet-music",
-    ];
+/// NTS API aliases for the eight Infinite Mixtapes, in channel order (indices
+/// 2..10 of `fallback_channels`). Used for both metadata fetches and the CLI
+/// station argument.
+const MIXTAPES: [&str; 8] = [
+    "poolside",
+    "slow-focus",
+    "100-percent-hip-hop",
+    "memory-lane",
+    "4-to-the-floor",
+    "island-time",
+    "the-tube",
+    "sheet-music",
+];
 
+fn fetch_mixtape_updates(known_artwork_urls: Vec<Option<String>>) -> Result<Vec<ChannelUpdate>> {
     let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
     let mut updates = Vec::with_capacity(MIXTAPES.len());
     for (offset, alias) in MIXTAPES.iter().enumerate() {
@@ -1182,8 +1295,7 @@ fn resolve_details(client: &Client, broadcast: &Broadcast) -> Details {
     let inline = broadcast.embeds.details.clone().unwrap_or_default();
     // Title, description, and either artwork size are independent fields; any of
     // them can be absent on its own. Only skip the request when all are present.
-    let has_artwork =
-        inline.media.picture_medium.is_some() || inline.media.picture_thumb.is_some();
+    let has_artwork = inline.media.picture_medium.is_some() || inline.media.picture_thumb.is_some();
     if inline.name.is_some() && inline.description.is_some() && has_artwork {
         return inline;
     }
@@ -1250,6 +1362,12 @@ fn crop_to_landscape(image: DynamicImage) -> DynamicImage {
         let target_width = target_width.clamp(1, width);
         image.crop_imm((width - target_width) / 2, 0, target_width, height)
     }
+}
+
+/// Delay before the next reconnect attempt: 1s, 2s, 4s… capped at 30s so a
+/// long outage still recovers promptly once the stream returns.
+fn reconnect_delay(attempts: u32) -> Duration {
+    Duration::from_secs(2u64.pow(attempts.min(5)).min(30))
 }
 
 fn launch_player(stream: &str) -> Result<Player> {
@@ -1322,8 +1440,12 @@ fn request_live_refresh(
             let sender = sender.clone();
             let client = client.clone();
             thread::spawn(move || {
-                let (url, image) =
-                    fetch_artwork(&client, medium.as_deref(), thumb.as_deref(), known.as_deref());
+                let (url, image) = fetch_artwork(
+                    &client,
+                    medium.as_deref(),
+                    thumb.as_deref(),
+                    known.as_deref(),
+                );
                 // fetch_artwork yields an image only for a fresh, successful
                 // download; an unchanged or failed cover sends nothing and is
                 // retried on the next live refresh.
@@ -1483,9 +1605,9 @@ fn run(
             request_mixtape_refresh(&update_tx, app.artwork_urls());
         }
         if app.playing && now >= next_player_probe {
-            app.poll_player();
+            let probe_delay = app.poll_player();
             app.sync_now_playing();
-            next_player_probe = now + Duration::from_secs(1);
+            next_player_probe = now + probe_delay;
             dirty = true;
             title_dirty = true;
         }
@@ -1519,23 +1641,35 @@ fn run(
         if app.visualizer.is_some() {
             poll_interval = poll_interval.min(Duration::from_millis(16));
         }
-        if event::poll(poll_interval)?
-            && let Event::Key(key) = event::read()?
-        {
+        if event::poll(poll_interval)? {
+            let event = event::read()?;
+            if let Event::Resize(_, _) = event {
+                // Ratatui resizes its buffers on the next draw; without this
+                // a stopped app keeps a stale layout until the next refresh.
+                dirty = true;
+                continue;
+            }
+            let Event::Key(key) = event else {
+                continue;
+            };
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+            // Raw mode disables ISIG, so ctrl+c arrives as a key event rather
+            // than SIGINT; honor the universal interrupt reflex.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
             }
             let had_overlay = app.visualizer.is_some() || app.view != View::Listen;
             dirty = match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
-                KeyCode::Esc => {
-                    if !app.close_visualizer() && !app.dismiss_overlay() {
-                        return Ok(());
-                    }
-                    true
+                // Esc dismisses; it never quits. Quitting the radio should be
+                // deliberate (`q` or ctrl+c), not a reflex keypress.
+                KeyCode::Esc => app.close_visualizer() || app.dismiss_overlay(),
+                KeyCode::Char(digit @ '1'..='9') => {
+                    app.change_station(digit as usize - '1' as usize)
                 }
-                KeyCode::Char('1') => app.change_station(0),
-                KeyCode::Char('2') => app.change_station(1),
+                KeyCode::Char('0') => app.change_station(9),
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     app.toggle_explore();
                     true
@@ -1694,9 +1828,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, compact: bool) {
             "↑↓ browse  •  e explore  •  s schedule  •  v visualizer  •  space listen"
         }
     } else if app.playing {
-        "↑↓ / j k change station    •    1 2 radio    •    e explore    •    s schedule    •    v visualizer    •    space stop    •    q quit"
+        "↑↓ / j k change station    •    1-0 stations    •    e explore    •    s schedule    •    v visualizer    •    space stop    •    q quit"
     } else {
-        "↑↓ / j k select    •    1 2 radio    •    e explore    •    s schedule    •    v visualizer    •    space listen    •    q quit"
+        "↑↓ / j k select    •    1-0 stations    •    e explore    •    s schedule    •    v visualizer    •    space listen    •    q quit"
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(MUTED)),
@@ -1708,10 +1842,10 @@ fn render_error(frame: &mut Frame<'_>, app: &App, footer_area: Rect) {
     // An explicit notice (playback errors, user hints) takes priority; otherwise
     // fall back to the connectivity notice so a failed fetch never looks like a
     // silent hang.
-    let notice = app
-        .error
-        .as_deref()
-        .or_else(|| app.connection_lost.then_some("◌ Couldn't reach NTS — retrying…"));
+    let notice = app.error.as_deref().or_else(|| {
+        app.connection_lost
+            .then_some("◌ Couldn't reach NTS — retrying…")
+    });
     if let Some(notice) = notice {
         let error_area = Rect {
             y: footer_area.y.saturating_sub(1),
@@ -2390,16 +2524,23 @@ fn now_text_height(channel: &Channel, width: u16, show_next: bool) -> u16 {
     // Use the exact same wrapper that paints the paragraph. The old local
     // approximation disagreed on Unicode and long words, which could make a
     // card one row too short and leave its text visually unbalanced.
-    let description_lines = Paragraph::new(channel.description.as_str())
-        .wrap(Wrap { trim: true })
-        .line_count(width)
-        .min(usize::from(u16::MAX)) as u16;
+    let wrapped_lines = |text: &str| {
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .line_count(width)
+            .min(usize::from(u16::MAX)) as u16
+    };
+    // The show title wraps too — NTS titles routinely exceed a narrow card's
+    // width — so measure it like the description instead of assuming one row.
+    let title_lines = wrapped_lines(&channel.show);
+    let description_lines = wrapped_lines(&channel.description);
     let next_lines = if show_next && channel.kind == ChannelKind::Live {
         2 // Spacer plus the schedule line.
     } else {
         0
     };
-    2u16.saturating_add(description_lines)
+    1u16.saturating_add(title_lines)
+        .saturating_add(description_lines)
         .saturating_add(next_lines)
 }
 
@@ -2419,7 +2560,10 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        assert_eq!(self_rel.episode_url(), Some("https://nts/api/v2/shows/x/episodes/y"));
+        assert_eq!(
+            self_rel.episode_url(),
+            Some("https://nts/api/v2/shows/x/episodes/y")
+        );
 
         let details_rel: Broadcast = serde_json::from_str(
             r#"{"broadcast_title":"Show","links":[
@@ -2428,7 +2572,10 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        assert_eq!(details_rel.episode_url(), Some("https://nts/api/v2/shows/x/episodes/y"));
+        assert_eq!(
+            details_rel.episode_url(),
+            Some("https://nts/api/v2/shows/x/episodes/y")
+        );
 
         // No type present: fall back to the /episodes/ path.
         let path_only: Broadcast = serde_json::from_str(
@@ -2437,7 +2584,10 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        assert_eq!(path_only.episode_url(), Some("https://nts/api/v2/shows/x/episodes/y"));
+        assert_eq!(
+            path_only.episode_url(),
+            Some("https://nts/api/v2/shows/x/episodes/y")
+        );
 
         // A non-episode self link (e.g. a channel) must not be mistaken for one.
         let channel: Broadcast = serde_json::from_str(
@@ -2469,7 +2619,10 @@ mod tests {
         let details = resolve_details(&Client::new(), &broadcast);
         assert_eq!(details.name.as_deref(), Some("Inline Name"));
         assert_eq!(details.description.as_deref(), Some("Inline description"));
-        assert_eq!(details.media.picture_medium.as_deref(), Some("https://nts/art.png"));
+        assert_eq!(
+            details.media.picture_medium.as_deref(),
+            Some("https://nts/art.png")
+        );
     }
 
     #[test]
@@ -2494,7 +2647,10 @@ mod tests {
         assert_eq!(merged.name.as_deref(), Some("Inline")); // kept
         assert_eq!(merged.description.as_deref(), Some("Episode desc")); // filled
         assert_eq!(merged.media.picture_medium.as_deref(), Some("inline.png")); // kept
-        assert_eq!(merged.media.picture_thumb.as_deref(), Some("episode_thumb.png")); // filled
+        assert_eq!(
+            merged.media.picture_thumb.as_deref(),
+            Some("episode_thumb.png")
+        ); // filled
     }
 
     fn test_app(selected: usize) -> App {
@@ -2510,6 +2666,7 @@ mod tests {
             visualizer: None,
             view: View::Listen,
             error: None,
+            reconnect_attempts: 0,
             connection_lost: false,
             encoded_tx: None,
         }
@@ -2688,6 +2845,77 @@ mod tests {
         )]);
 
         assert!(app.channels[0].artwork_url.is_none());
+    }
+
+    #[test]
+    fn a_populated_schedule_is_never_replaced_by_a_channel_update() {
+        let mut app = test_app(0);
+        let existing = ScheduleEntry {
+            starts_at: "10:00".to_owned(),
+            title: "Existing".to_owned(),
+        };
+        app.channels[0].schedule = vec![existing; 6];
+        let mut update = test_channel_update(0, None, None);
+        update.schedule = Some(vec![ScheduleEntry {
+            starts_at: "11:00".to_owned(),
+            title: "Two-entry now/next".to_owned(),
+        }]);
+
+        app.apply_channel_updates(vec![update]);
+
+        assert_eq!(app.channels[0].schedule.len(), 6);
+        assert_eq!(app.channels[0].schedule[0].title, "Existing");
+    }
+
+    #[test]
+    fn an_empty_schedule_may_be_seeded_by_a_channel_update() {
+        let mut app = test_app(0);
+        let mut update = test_channel_update(0, None, None);
+        update.schedule = Some(vec![ScheduleEntry {
+            starts_at: "11:00".to_owned(),
+            title: "Seed".to_owned(),
+        }]);
+
+        app.apply_channel_updates(vec![update]);
+
+        assert_eq!(app.channels[0].schedule.len(), 1);
+    }
+
+    #[test]
+    fn card_height_accounts_for_a_wrapped_show_title() {
+        let mut channels = fallback_channels();
+        let channel = &mut channels[2]; // Mixtape: no next-up block.
+        channel.show = "A Show Title That Definitely Wraps Onto Several Lines".to_owned();
+        channel.description = "Short.".to_owned();
+        let width = 20;
+        let title_lines = Paragraph::new(channel.show.as_str())
+            .wrap(Wrap { trim: true })
+            .line_count(width) as u16;
+        assert!(title_lines >= 2, "test title must wrap at width {width}");
+
+        // Kicker row + wrapped title rows + one description row.
+        assert_eq!(now_text_height(channel, width, false), 1 + title_lines + 1);
+    }
+
+    #[test]
+    fn station_arguments_resolve_forgivingly() {
+        assert_eq!(station_index("1"), Some(0));
+        assert_eq!(station_index("2"), Some(1));
+        assert_eq!(station_index("NTS 2"), Some(1));
+        assert_eq!(station_index("Poolside"), Some(2));
+        assert_eq!(station_index("slow-focus"), Some(3));
+        assert_eq!(station_index("SLOW FOCUS"), Some(3));
+        assert_eq!(station_index("low key"), Some(4));
+        assert_eq!(station_index("100-percent-hip-hop"), Some(4));
+        assert_eq!(station_index("sheet-music"), Some(9));
+        assert_eq!(station_index("bogus"), None);
+        assert_eq!(station_index(""), None);
+    }
+
+    #[test]
+    fn reconnect_delays_back_off_and_cap_at_thirty_seconds() {
+        let seconds: Vec<u64> = (0..7).map(|a| reconnect_delay(a).as_secs()).collect();
+        assert_eq!(seconds, vec![1, 2, 4, 8, 16, 30, 30]);
     }
 
     #[test]
